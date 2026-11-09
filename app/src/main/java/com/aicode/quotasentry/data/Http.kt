@@ -129,6 +129,81 @@ class HttpEngine(proxyConfig: ProxyConfig = ProxyConfig()) {
         }
     }
 
+    /**
+     * 把 [url] 的内容下载到 [dest]（用于 APK 自动更新）。
+     *
+     * - 跟随 3xx 跳转，默认 `Accept-Encoding: identity`，避免进度和实际字节对不上；
+     * - [onProgress] 大约每 100ms 回调一次，总大小未知时 total = -1；
+     * - 大小不匹配 / 非 2xx / 网络异常都返回 [HttpResult.Fail]，不抛异常。
+     */
+    fun downloadTo(
+        url: String,
+        dest: java.io.File,
+        headers: Map<String, String> = emptyMap(),
+        onProgress: (downloaded: Long, total: Long) -> Unit = { _, _ -> }
+    ): HttpResult {
+        var currentUrl = url
+        var redirects = 0
+        return try {
+            while (true) {
+                val merged = headers + ("Accept-Encoding" to "identity")
+                val conn = openConnection(currentUrl, METHOD_GET, merged, null, null)
+                try {
+                    val code = conn.responseCode
+                    val location = conn.getHeaderField("Location")
+                    if (code in 300..399 && !location.isNullOrBlank() && redirects < MAX_REDIRECTS) {
+                        redirects++
+                        currentUrl = resolveUrl(currentUrl, location)
+                        continue
+                    }
+                    if (code !in 200..299) {
+                        val snippet = runCatching {
+                            readBounded(openStream(conn), MAX_ERROR_BYTES)
+                        }.getOrDefault("")
+                        val extra = snippet.trim().take(120)
+                        return HttpResult.Fail(
+                            "下载失败（HTTP $code）" + if (extra.isBlank()) "" else "：$extra"
+                        )
+                    }
+                    val total = conn.contentLengthLong.takeIf { it > 0 } ?: -1L
+                    dest.parentFile?.mkdirs()
+                    var downloaded = 0L
+                    var lastNotify = 0L
+                    val input = openStream(conn)
+                    java.io.FileOutputStream(dest).use { out ->
+                        val buffer = ByteArray(64 * 1024)
+                        while (true) {
+                            val read = input.read(buffer)
+                            if (read < 0) break
+                            out.write(buffer, 0, read)
+                            downloaded += read
+                            val now = System.nanoTime()
+                            if (now - lastNotify > 100_000_000L) {
+                                lastNotify = now
+                                runCatching { onProgress(downloaded, total) }
+                            }
+                        }
+                        out.flush()
+                    }
+                    runCatching { input.close() }
+                    runCatching { onProgress(downloaded, total) }
+                    if (total > 0 && downloaded < total) {
+                        runCatching { dest.delete() }
+                        return HttpResult.Fail("下载不完整（$downloaded/$total 字节），请重试")
+                    }
+                    return HttpResult.Ok(HttpResponse(200, emptyMap(), "", conn.url.toString()))
+                } finally {
+                    runCatching { conn.disconnect() }
+                }
+            }
+            @Suppress("UNREACHABLE_CODE")
+            HttpResult.Fail("下载失败：无法完成跳转")
+        } catch (t: Throwable) {
+            if (t is kotlinx.coroutines.CancellationException) throw t
+            HttpResult.Fail(networkErrorText(t))
+        }
+    }
+
     // ------------------------------------------------------------------ 内部实现
 
     private fun execute(

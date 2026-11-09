@@ -14,7 +14,8 @@
 - **后台常驻**：`specialUse` 前台服务 + 划掉任务不退出 + 开机自启 + 精确闹钟兜底 + 电池优化/自启动引导
 - **代理**：HTTP / SOCKS5，国内网络基本必备
 - **Liquid Glass + MIUIX**：深色优先的液体玻璃界面，三 Tab 丝滑切换，支持浅色与强调色自定义
-- **自动更新**：从本仓库 Release 检查新版本，应用内下载安装
+- **自动更新**：从本仓库 Release 检查新版本，应用内下载安装（启动时 6 小时一次自动检查）
+- **Claude OAuth 额度**：可选粘贴 Claude Code 的 OAuth 令牌，直接读取官方 5h / 7d 用量；发送消息仍用网页 Cookie
 
 ## 安装
 
@@ -42,7 +43,7 @@ core/       共享数据模型、额度窗口计算、定时计算、SharedPrefe
 data/       三家 Provider 适配器 + HttpURLConnection 引擎（代理/SSE）+ 容错 JSON 解析
 service/    前台服务、发送引擎、闹钟调度、通知、开机自启、后台可靠性引导
 ui/         Compose + Liquid Glass + MIUIX 风格三 Tab 界面、网页登录 WebView
-update/     GitHub Release 检查、APK 下载与安装
+update/     GitHub Release 检查、版本比较、APK 下载与安装（FileProvider）
 ```
 
 - 无 Room / OkHttp / 图片库等重型依赖，release APK ≈ 1.3 MB；

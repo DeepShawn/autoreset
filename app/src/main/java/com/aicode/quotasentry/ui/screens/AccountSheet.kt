@@ -219,18 +219,42 @@ fun AccountSheet(provider: ProviderId?, onDismiss: () -> Unit) {
             )
         }
 
-        if (current == ProviderId.CHATGPT) {
+        // Claude 用 OAuth 令牌读官方 5h / 7d 用量；ChatGPT 用 accessToken 兜底。
+        // Gemini 没有可用的令牌接口，不显示这一栏。
+        if (current != ProviderId.GEMINI) {
             Spacer(Modifier.height(12.dp))
-            MText(text = "Access Token（可选）", color = p.dim, style = QsType.tiny)
+            MText(
+                text = if (current == ProviderId.CLAUDE) {
+                    "Claude Code OAuth 令牌（可选，额度更准）"
+                } else {
+                    "Access Token（可选，兜底）"
+                },
+                color = p.dim,
+                style = QsType.tiny
+            )
             Spacer(Modifier.height(6.dp))
             GlassTextField(
                 value = accessToken,
                 onValueChange = { accessToken = it },
-                placeholder = "eyJhbGciOi…（浏览器 chatgpt.com/api/auth/session 里的 accessToken）",
+                placeholder = if (current == ProviderId.CLAUDE) {
+                    "sk-ant-oat01-…（~/.claude/.credentials.json 里的 accessToken）"
+                } else {
+                    "eyJhbGciOi…（浏览器 chatgpt.com/api/auth/session 里的 accessToken）"
+                },
                 singleLine = true,
                 monospace = true,
                 password = hidden,
                 keyboardType = KeyboardType.Text
+            )
+            Spacer(Modifier.height(6.dp))
+            MText(
+                text = if (current == ProviderId.CLAUDE) {
+                    "仅用于读取官方 5 小时 / 7 天用量；发送保活消息仍需要上面的 claude.ai Cookie。只有令牌没有 Cookie 时不能发送。"
+                } else {
+                    "Cookie 失效时可以只填 accessToken 查额度 / 发送消息。"
+                },
+                color = p.faint,
+                style = QsType.tiny
             )
         }
 

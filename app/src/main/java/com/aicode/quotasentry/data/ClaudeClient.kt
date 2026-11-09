@@ -20,7 +20,11 @@ import kotlin.math.roundToInt
  * 端点（2025-11 用公开逆向实现核实；接口随时可能变，全部失败可解释，不抛异常）：
  * - 身份/组织：`GET https://claude.ai/api/organizations` → 数组，取第一个的 `uuid`；
  *   `capabilities` / `billing_type` 推断 plan。
- * - 官方额度：`GET https://claude.ai/api/organizations/{org}/usage`
+ * - Claude Code OAuth 额度：`GET https://api.anthropic.com/api/oauth/usage`
+ *   （Bearer access token + `anthropic-beta: oauth-2025-04-20`；响应同样是
+ *   `five_hour.{utilization 0..100, resets_at RFC3339}`，另有 `seven_day`）。
+ *   只要导入 token（`Credentials.accessToken`）即可连接/查额度；发送消息仍需 claude.ai Cookie。
+ * - 网页版官方额度：`GET https://claude.ai/api/organizations/{org}/usage`
  *   → `five_hour.{utilization,resets_at}`（utilization 0..100，resets_at 为 RFC3339 字符串）；
  *   部分账号/版本还会返回 `seven_day`、`limits[]`（kind/percent/severity）、`standard.rate_limit`。
  *   备用候选：`GET .../rate_limits`（该接口的 resets_at 是 epoch 秒）。
@@ -77,22 +81,52 @@ class ClaudeClient : ProviderClient {
 
     private fun connectInternal(account: Account, settings: Settings): ConnectResult {
         val cookie = cookieOf(account)
-        if (cookie.isBlank()) {
+        val token = tokenOf(account)
+        if (cookie.isBlank() && token.isBlank()) {
             return ConnectResult.Fail(
-                "未填写 Claude Cookie：请先在浏览器登录 claude.ai，复制包含 sessionKey 的整段 Cookie"
+                "未填写 Claude 凭据：请粘贴 claude.ai 的 sessionKey Cookie，" +
+                    "或在 Claude Code 登录后导入 OAuth access token"
             )
         }
         val engine = HttpEngine(settings.proxy)
+
+        // 1) OAuth 令牌：优先用它验证并取官方额度
+        var oauthPatch: QuotaPatch? = null
+        var oauthError: Res.Err? = null
+        if (token.isNotBlank()) {
+            when (val oauth = fetchOAuthUsage(engine, token)) {
+                is Res.Ok -> oauthPatch = oauth.value
+                is Res.Err -> oauthError = oauth
+            }
+        }
+
+        // 2) 只有 token（没有 Cookie）：用 OAuth 结果验证连接，发送仍不可用（见 send）
+        if (cookie.isBlank()) {
+            val patch = oauthPatch
+            if (patch != null) {
+                if (patch.plan.isNotBlank()) ProviderCache.put(id, KEY_PLAN, patch.plan)
+                return ConnectResult.Ok(plan = patch.plan, label = "Claude Code", quota = patch)
+            }
+            return ConnectResult.Fail(
+                oauthError?.message
+                    ?: "Claude Code OAuth 令牌无效：请确认 access token 未过期且包含 user:profile 权限"
+            )
+        }
+
+        // 3) 有 Cookie：保持原有「组织校验」逻辑；官方额度优先用 OAuth 结果
         val org = when (val result = fetchOrganization(engine, account, cookie)) {
             is Res.Err -> return ConnectResult.Fail(result.message)
             is Res.Ok -> result.value
         }
-        // 额度只是「顺便拿」，失败不影响连接结果
-        val patch = when (val quota = fetchUsage(engine, account, cookie, org.uuid)) {
+        val patch = oauthPatch ?: when (val quota = fetchUsage(engine, account, cookie, org.uuid)) {
             is Res.Ok -> quota.value
             is Res.Err -> null
         }
-        return ConnectResult.Ok(plan = org.plan, label = org.label, quota = patch)
+        return ConnectResult.Ok(
+            plan = org.plan.ifBlank { patch?.plan.orEmpty() },
+            label = org.label,
+            quota = patch
+        )
     }
 
     private fun fetchOrganization(
@@ -129,20 +163,90 @@ class ClaudeClient : ProviderClient {
 
     private fun fetchQuotaInternal(account: Account, settings: Settings): QuotaFetch {
         val cookie = cookieOf(account)
-        if (cookie.isBlank()) {
-            return QuotaFetch.Fail("未填写 Claude Cookie，无法查询额度", unauthorized = true)
+        val token = tokenOf(account)
+        if (cookie.isBlank() && token.isBlank()) {
+            return QuotaFetch.Fail(
+                "未填写 Claude 凭据：请粘贴 claude.ai Cookie 或导入 Claude Code OAuth 令牌",
+                unauthorized = true
+            )
         }
         val engine = HttpEngine(settings.proxy)
-        val orgId = when (val org = resolveOrgId(engine, account, cookie)) {
-            is Res.Err -> return QuotaFetch.Fail(org.message, unauthorized = org.unauthorized)
-            is Res.Ok -> org.value
+
+        // 1) OAuth 优先：只导入 token 也能查官方额度
+        var oauthError: Res.Err? = null
+        if (token.isNotBlank()) {
+            when (val oauth = fetchOAuthUsage(engine, token)) {
+                is Res.Ok -> return QuotaFetch.Ok(oauth.value)
+                is Res.Err -> oauthError = oauth
+            }
         }
-        return when (val usage = fetchUsage(engine, account, cookie, orgId)) {
-            is Res.Ok -> QuotaFetch.Ok(usage.value)
-            is Res.Err -> if (usage.unsupported) {
-                QuotaFetch.Unsupported(usage.message)
+        if (cookie.isBlank()) {
+            val error = oauthError ?: return QuotaFetch.Fail("未填写 Claude 凭据")
+            return if (error.unsupported) {
+                QuotaFetch.Unsupported(error.message)
             } else {
-                QuotaFetch.Fail(usage.message, unauthorized = usage.unauthorized)
+                QuotaFetch.Fail(error.message, unauthorized = error.unauthorized)
+            }
+        }
+
+        // 2) 网页 Cookie 接口回退
+        val cookieResult: QuotaFetch = when (val org = resolveOrgId(engine, account, cookie)) {
+            is Res.Err -> if (org.unsupported) {
+                QuotaFetch.Unsupported(org.message)
+            } else {
+                QuotaFetch.Fail(org.message, unauthorized = org.unauthorized)
+            }
+            is Res.Ok -> when (val usage = fetchUsage(engine, account, cookie, org.value)) {
+                is Res.Ok -> QuotaFetch.Ok(usage.value)
+                is Res.Err -> if (usage.unsupported) {
+                    QuotaFetch.Unsupported(usage.message)
+                } else {
+                    QuotaFetch.Fail(usage.message, unauthorized = usage.unauthorized)
+                }
+            }
+        }
+        val error = oauthError ?: return cookieResult
+        // 3) 两者都失败：合并原因，UI 能看到 OAuth 与 Cookie 各自的问题
+        return when (cookieResult) {
+            is QuotaFetch.Ok -> cookieResult
+            is QuotaFetch.Unsupported -> QuotaFetch.Unsupported(
+                "OAuth：${error.message}；Cookie：${cookieResult.message}"
+            )
+            is QuotaFetch.Fail -> QuotaFetch.Fail(
+                "OAuth：${error.message}；Cookie：${cookieResult.message}",
+                unauthorized = error.unauthorized || cookieResult.unauthorized
+            )
+        }
+    }
+
+    /** Claude Code OAuth 官方额度（Bearer token，Bearer 头 + anthropic-beta）。 */
+    private fun fetchOAuthUsage(engine: HttpEngine, token: String): Res<QuotaPatch> {
+        val now = System.currentTimeMillis()
+        return when (val result = engine.get(URL_OAUTH_USAGE, claudeOAuthHeaders(token))) {
+            is HttpResult.Fail -> Res.Err(result.message)
+            is HttpResult.Ok -> {
+                val response = result.response
+                when {
+                    response.ok -> parseClaudeOAuthUsage(response.body, now)
+                        ?.let { Res.Ok(it) }
+                        ?: Res.Err("Claude Code OAuth 额度接口返回结构无法识别，可能已变更")
+                    response.code == 401 -> Res.Err(
+                        "Claude Code OAuth 令牌已失效（HTTP 401），请重新登录 Claude Code 并导入最新 access token",
+                        unauthorized = true
+                    )
+                    response.code == 403 -> Res.Err(
+                        "Claude Code OAuth 令牌被拒绝（HTTP 403），请确认令牌具有 user:profile 权限",
+                        unauthorized = true
+                    )
+                    response.code == 404 -> Res.Err(
+                        "Claude Code OAuth 额度接口不可用（HTTP 404），等待适配更新",
+                        unsupported = true
+                    )
+                    response.code == 429 -> Res.Err(
+                        "Claude Code OAuth 额度查询过于频繁（HTTP 429），稍后再试"
+                    )
+                    else -> Res.Err(httpFailureText("Claude Code", response.code, response.body))
+                }
             }
         }
     }
@@ -222,9 +326,15 @@ class ClaudeClient : ProviderClient {
     ): SendOutcome {
         val cookie = cookieOf(account)
         if (cookie.isBlank()) {
+            val hasToken = tokenOf(account).isNotBlank()
             return SendOutcome(
                 ok = false,
-                detail = "未填写 Claude Cookie，请先在设置里连接账号",
+                detail = if (hasToken) {
+                    "仅导入了 OAuth 令牌；发送保活消息需要 claude.ai 的 sessionKey Cookie，" +
+                        "请在账号设置里再粘贴 Cookie"
+                } else {
+                    "未填写 Claude Cookie，请先在设置里连接账号"
+                },
                 unauthorized = true
             )
         }
@@ -420,6 +530,10 @@ class ClaudeClient : ProviderClient {
     private fun cookieOf(account: Account): String =
         CredentialUtil.claudeCookie(account.credentials.cookie)
 
+    /** Claude Code OAuth access token：复用 `Credentials.accessToken`（UI 新增的输入框）。 */
+    private fun tokenOf(account: Account): String =
+        account.credentials.accessToken.trim()
+
     private fun headers(account: Account, cookie: String): Map<String, String> =
         BrowserHeaders.claude(cookie, deviceId(account, cookie))
 
@@ -444,6 +558,7 @@ class ClaudeClient : ProviderClient {
 
     private companion object {
         const val URL_ORGANIZATIONS = "https://claude.ai/api/organizations"
+        const val URL_OAUTH_USAGE = "https://api.anthropic.com/api/oauth/usage"
         const val KEY_ORG_ID = "orgId"
         const val KEY_PLAN = "plan"
         const val KEY_LABEL = "label"
@@ -587,3 +702,71 @@ internal fun percentText(fraction: Float): String =
 
 internal const val FIVE_HOURS: Long = 5L * 60 * 60 * 1000
 internal const val SEVEN_DAYS: Long = 7L * 24 * 60 * 60 * 1000
+
+
+// ---------------------------------------------------------------------- Claude Code OAuth（可单测）
+
+/** Claude Code OAuth 额度接口的请求头。 */
+internal fun claudeOAuthHeaders(token: String): Map<String, String> = mapOf(
+    "Authorization" to "Bearer $token",
+    "anthropic-beta" to "oauth-2025-04-20",
+    "anthropic-version" to "2023-06-01",
+    "Accept" to "application/json",
+    "User-Agent" to HttpEngine.DEFAULT_USER_AGENT,
+    "Accept-Language" to HttpEngine.DEFAULT_ACCEPT_LANGUAGE
+)
+
+/**
+ * 解析 `GET https://api.anthropic.com/api/oauth/usage` 的响应。
+ *
+ * 响应形如：
+ * ```json
+ * {"five_hour":{"utilization":83.0,"resets_at":"2026-06-02T08:30:00.701157+00:00"},
+ *  "seven_day":{"utilization":14.0,"resets_at":"..."}}
+ * ```
+ * - `utilization` 是 0..100 百分数（本文件统一按 >1.5 视为百分数，兼容 0..1 的历史形态）；
+ * - `resets_at` 是 RFC3339（支持小数秒与时区偏移）；
+ * - 正常路径强制窗口 5h；若只有 seven_day 数据，则退化为 7 天窗口（避免把 7 天用量标成 5 小时）；
+ * - 所有字段都可能缺失/为 null，解析失败返回 null，由调用方给中文错误。
+ */
+internal fun parseClaudeOAuthUsage(raw: String, now: Long): QuotaPatch? {
+    val root = parseJsonObjectLenient(raw) ?: return null
+    val five = root.optJSONObject("five_hour")
+    val seven = root.optJSONObject("seven_day")
+    val fiveUsed = five?.let { readUsedFraction(it) }
+    val sevenUsed = seven?.let { readUsedFraction(it) }
+    val plan = extractPlanHint(root)
+
+    if (fiveUsed == null && sevenUsed == null) {
+        // 结构不认识时退回通用解析（仍按 5 小时窗口展示）
+        return parseClaudeUsage(raw, now)?.let { it.copy(officialWindowMillis = FIVE_HOURS) }
+    }
+    val used: Float
+    val window: Long
+    val resetAt: Long?
+    val label: String
+    if (fiveUsed != null) {
+        used = fiveUsed
+        window = FIVE_HOURS
+        resetAt = five?.let { readResetAt(it, now) }
+        label = "5 小时窗口"
+    } else {
+        used = sevenUsed ?: return null
+        window = SEVEN_DAYS
+        resetAt = seven?.let { readResetAt(it, now) }
+        label = "7 天窗口"
+    }
+
+    val details = mutableListOf<String>()
+    details += "${label}已用 ${percentText(used)}"
+    if (fiveUsed != null && sevenUsed != null) {
+        details += "7 天窗口已用 ${percentText(sevenUsed)}"
+    }
+    return QuotaPatch(
+        officialUsedFraction = used,
+        officialWindowMillis = window,
+        officialResetAt = resetAt,
+        officialDetail = details.joinToString("；"),
+        plan = plan
+    )
+}

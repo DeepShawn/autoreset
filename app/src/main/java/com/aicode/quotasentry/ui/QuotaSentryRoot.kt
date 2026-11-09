@@ -26,6 +26,7 @@ import androidx.compose.foundation.pager.PagerState
 import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -36,6 +37,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.IntOffset
@@ -52,6 +54,8 @@ import com.aicode.quotasentry.ui.screens.EventsSheet
 import com.aicode.quotasentry.ui.screens.ProviderDetailSheet
 import com.aicode.quotasentry.ui.screens.SchedulesScreen
 import com.aicode.quotasentry.ui.screens.SettingsScreen
+import com.aicode.quotasentry.ui.screens.UpdateDialogHost
+import com.aicode.quotasentry.update.UpdateCenter
 import com.aicode.quotasentry.ui.screens.rememberNow
 import com.aicode.quotasentry.ui.theme.QuotaSentryTheme
 import com.aicode.quotasentry.ui.theme.QsDims
@@ -79,12 +83,18 @@ fun QuotaSentryRoot() {
 
 @Composable
 private fun RootContent() {
+    val context = LocalContext.current
     val pager = rememberPagerState(pageCount = { 3 })
     val scope = rememberCoroutineScope()
     val now = rememberNow()
     var selectedAccount by remember { mutableStateOf<ProviderId?>(null) }
     var selectedProvider by remember { mutableStateOf<ProviderId?>(null) }
     var eventsOpen by remember { mutableStateOf(false) }
+
+    // 冷启动自动检查更新（UpdateCenter 内部限制 6 小时一次，弱网/无网失败静默）。
+    LaunchedEffect(Unit) {
+        UpdateCenter.maybeAutoCheck(context)
+    }
 
     // 返回键：不在首页时先回上一页，符合单手使用习惯。
     BackHandler(enabled = pager.currentPage != 0) {
@@ -153,6 +163,7 @@ private fun RootContent() {
         open = eventsOpen,
         onDismiss = { eventsOpen = false }
     )
+    UpdateDialogHost()
 }
 
 private data class QsTab(val label: String, val icon: QsIcon)

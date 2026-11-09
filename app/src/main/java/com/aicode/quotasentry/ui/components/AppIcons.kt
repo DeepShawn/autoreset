@@ -30,7 +30,7 @@ import com.aicode.quotasentry.ui.theme.QsTheme
 enum class QsIcon {
     HOME, CALENDAR, SETTINGS, HISTORY, REFRESH, PLUS, MINUS,
     CHEVRON_RIGHT, CHEVRON_DOWN, BACK, CHECK, CLOSE, MORE,
-    SEND, BOLT, TRASH, CLOCK, LINK, SHIELD, BATTERY, BELL, WIFI,
+    SEND, DOWNLOAD, BOLT, TRASH, CLOCK, LINK, SHIELD, BATTERY, BELL, WIFI,
     PALETTE, INFO, COPY, PASTE, GLOBE, EYE, EYE_OFF, WARN,
     PLAY, STOP, AUTO_START, LOCK, CODE, POWER, RESET
 }
@@ -203,6 +203,15 @@ fun DrawScope.drawQsIcon(icon: QsIcon, tint: Color, stroke: Float) {
                 lineTo(o(20.6f, 3.6f).x, o(20.6f, 3.6f).y)
             }
             drawPath(path, tint, style = strokeStyle)
+        }
+
+        QsIcon.DOWNLOAD -> {
+            l(12f, 3.6f, 12f, 15.2f)
+            l(7.2f, 10.6f, 12f, 15.2f)
+            l(16.8f, 10.6f, 12f, 15.2f)
+            l(4.2f, 18.2f, 4.2f, 20.4f)
+            l(4.2f, 20.4f, 19.8f, 20.4f)
+            l(19.8f, 20.4f, 19.8f, 18.2f)
         }
 
         QsIcon.BOLT -> {

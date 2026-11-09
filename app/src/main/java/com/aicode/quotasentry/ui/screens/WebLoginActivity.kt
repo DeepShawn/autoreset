@@ -268,7 +268,7 @@ private fun WebLoginScreen(provider: ProviderId, onClose: () -> Unit) {
                             settings.displayZoomControls = false
                             settings.setSupportMultipleWindows(false)
                             settings.userAgentString = settings.userAgentString +
-                                " QuotaSentry/1.0 (Android)"
+                                " QuotaSentry/" + com.aicode.quotasentry.update.UpdateCenter.currentVersion + " (Android)"
                             CookieManager.getInstance().setAcceptCookie(true)
                             CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
                             webViewClient = object : WebViewClient() {

@@ -1,6 +1,7 @@
 package com.aicode.quotasentry.data
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -160,5 +161,70 @@ class ClaudeParsingTest {
         assertEquals("67%", percentText(0.67f))
         assertEquals("0%", percentText(0f))
         assertEquals("100%", percentText(1f))
+    }
+
+    // ---------------------------------------------------------- Claude Code OAuth
+
+    @Test
+    fun `OAuth usage 正常解析 百分数 RFC3339 加七天窗口`() {
+        val json = """
+            {"five_hour":{"utilization":83.0,"resets_at":"2026-06-02T08:30:00.701157+00:00"},
+             "seven_day":{"utilization":14.0,"resets_at":"2026-06-09T00:00:00Z"}}
+        """.trimIndent()
+        val patch = parseClaudeOAuthUsage(json, now)!!
+        assertEquals(0.83f, patch.officialUsedFraction!!, 0.0001f)
+        assertEquals(18_000_000L, patch.officialWindowMillis)
+        assertEquals(
+            Instant.parse("2026-06-02T08:30:00.701157Z").toEpochMilli(),
+            patch.officialResetAt
+        )
+        assertTrue(patch.officialDetail.contains("5 小时窗口已用 83%"))
+        assertTrue(patch.officialDetail.contains("7 天窗口已用 14%"))
+    }
+
+    @Test
+    fun `OAuth usage 字段缺失容错`() {
+        // 只有 utilization，没有 resets_at；窗口仍是 5h，重置时间未知
+        val partial = parseClaudeOAuthUsage("""{"five_hour":{"utilization":42.0}}""", now)!!
+        assertEquals(0.42f, partial.officialUsedFraction!!, 0.0001f)
+        assertEquals(18_000_000L, partial.officialWindowMillis)
+        assertNull(partial.officialResetAt)
+        assertFalse(partial.officialDetail.contains("7 天窗口"))
+
+        // 空对象 / null 字段 / 非法 JSON → null
+        assertNull(parseClaudeOAuthUsage("{}", now))
+        assertNull(parseClaudeOAuthUsage("""{"five_hour":null,"seven_day":null}""", now))
+        assertNull(parseClaudeOAuthUsage("not json", now))
+        assertNull(parseClaudeOAuthUsage("", now))
+    }
+
+    @Test
+    fun `OAuth usage 兼容 0 到 1 量纲`() {
+        val json = """{"five_hour":{"utilization":0.42,"resets_at":"2026-06-02T08:30:00+00:00"}}"""
+        val patch = parseClaudeOAuthUsage(json, now)!!
+        assertEquals(0.42f, patch.officialUsedFraction!!, 0.0001f)
+        assertEquals(
+            Instant.parse("2026-06-02T08:30:00Z").toEpochMilli(),
+            patch.officialResetAt
+        )
+    }
+
+    @Test
+    fun `OAuth usage 只有七天窗口时退化为 7 天`() {
+        val json = """{"seven_day":{"utilization":14.0,"resets_at":"2026-06-09T00:00:00Z"}}"""
+        val patch = parseClaudeOAuthUsage(json, now)!!
+        assertEquals(0.14f, patch.officialUsedFraction!!, 0.0001f)
+        assertEquals(7L * 24 * 60 * 60 * 1000, patch.officialWindowMillis)
+        assertTrue(patch.officialDetail.contains("7 天窗口已用 14%"))
+    }
+
+    @Test
+    fun `OAuth 请求头`() {
+        val headers = claudeOAuthHeaders("tok-123")
+        assertEquals("Bearer tok-123", headers["Authorization"])
+        assertEquals("oauth-2025-04-20", headers["anthropic-beta"])
+        assertEquals("2023-06-01", headers["anthropic-version"])
+        assertEquals("application/json", headers["Accept"])
+        assertTrue(headers["User-Agent"]!!.isNotBlank())
     }
 }

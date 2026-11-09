@@ -39,7 +39,6 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
-import com.aicode.quotasentry.BuildConfig
 import com.aicode.quotasentry.core.AccentColor
 import com.aicode.quotasentry.core.ProviderId
 import com.aicode.quotasentry.core.ProxyType
@@ -47,12 +46,16 @@ import com.aicode.quotasentry.core.Store
 import com.aicode.quotasentry.core.ThemeMode
 import com.aicode.quotasentry.service.BackgroundStatus
 import com.aicode.quotasentry.service.ServiceController
+import com.aicode.quotasentry.update.UpdateCenter
+import com.aicode.quotasentry.update.UpdateParser
+import com.aicode.quotasentry.update.UpdateState
 import com.aicode.quotasentry.ui.components.GlassButton
 import com.aicode.quotasentry.ui.components.GlassButtonStyle
 import com.aicode.quotasentry.ui.components.GlassChip
 import com.aicode.quotasentry.ui.components.GlassSheet
 import com.aicode.quotasentry.ui.components.GlassTextField
 import com.aicode.quotasentry.ui.components.ListRow
+import com.aicode.quotasentry.ui.components.LoadingRing
 import com.aicode.quotasentry.ui.components.MText
 import com.aicode.quotasentry.ui.components.MiuixSlider
 import com.aicode.quotasentry.ui.components.MiuixSwitch
@@ -64,6 +67,7 @@ import com.aicode.quotasentry.ui.components.SectionCard
 import com.aicode.quotasentry.ui.components.SegmentedControl
 import com.aicode.quotasentry.ui.components.StatusDot
 import com.aicode.quotasentry.ui.components.Stepper
+import com.aicode.quotasentry.ui.components.ThinProgressBar
 import com.aicode.quotasentry.ui.theme.QsDims
 import com.aicode.quotasentry.ui.theme.QsTheme
 import com.aicode.quotasentry.ui.theme.QsType
@@ -89,6 +93,23 @@ fun SettingsScreen(now: Long, onOpenAccount: (ProviderId) -> Unit) {
     var showMiuiGuide by remember { mutableStateOf(false) }
     var showDisclaimer by remember { mutableStateOf(false) }
     var showClearConfirm by remember { mutableStateOf(false) }
+
+    // 自动更新：订阅进程内单例状态，手动检查后的「已是最新」用 toast 反馈。
+    val updateState by UpdateCenter.state.collectAsState()
+    var manualCheck by remember { mutableStateOf(false) }
+    LaunchedEffect(updateState, manualCheck) {
+        if (!manualCheck) return@LaunchedEffect
+        when (val s = updateState) {
+            is UpdateState.UpToDate -> {
+                AppToast.show(context, "已是最新版本 v" + s.version)
+                manualCheck = false
+                UpdateCenter.dismiss()
+            }
+
+            is UpdateState.Available, is UpdateState.Downloading, is UpdateState.Error -> manualCheck = false
+            else -> Unit
+        }
+    }
 
     LazyColumn(
         modifier = Modifier.fillMaxWidth(),
@@ -373,13 +394,66 @@ fun SettingsScreen(now: Long, onOpenAccount: (ProviderId) -> Unit) {
                         showChevron = true,
                         onClick = { showDisclaimer = true }
                     )
+                    val updateSubtitle = when (val s = updateState) {
+                        UpdateState.Idle -> "当前版本 v${UpdateCenter.currentVersion}"
+                        UpdateState.Checking -> "正在检查新版本…"
+                        is UpdateState.UpToDate -> "已是最新 v${s.version}"
+                        is UpdateState.Available ->
+                            "发现新版本 v${s.info.versionName} · " + UpdateParser.humanSize(s.info.sizeBytes)
+                        is UpdateState.Downloading ->
+                            "正在下载 v${s.info.versionName} · " + (s.progress.coerceAtLeast(0f) * 100).roundToInt() + "%"
+                        is UpdateState.Error -> s.message
+                    }
+                    val checkUpdate: (() -> Unit)? = when (updateState) {
+                        UpdateState.Checking, is UpdateState.Downloading, is UpdateState.Available -> null
+                        else -> {
+                            ({ manualCheck = true; UpdateCenter.check(context) })
+                        }
+                    }
+                    ListRow(
+                        title = "检查更新",
+                        subtitle = updateSubtitle,
+                        leadingIcon = QsIcon.DOWNLOAD,
+                        trailing = {
+                            when (val s = updateState) {
+                                UpdateState.Checking -> LoadingRing(ringSize = 18.dp, color = p.accent)
+                                is UpdateState.Available -> GlassChip(text = "可更新", height = 26.dp)
+                                is UpdateState.Downloading -> MText(
+                                    text = (s.progress.coerceAtLeast(0f) * 100).roundToInt().toString() + "%",
+                                    color = p.accent,
+                                    style = QsType.tiny,
+                                    maxLines = 1
+                                )
+                                is UpdateState.Error -> GlassChip(
+                                    text = "重试",
+                                    onClick = { manualCheck = true; UpdateCenter.check(context) },
+                                    height = 26.dp
+                                )
+                                else -> MText(
+                                    text = "v" + UpdateCenter.currentVersion,
+                                    color = p.dim,
+                                    style = QsType.caption,
+                                    maxLines = 1
+                                )
+                            }
+                        },
+                        onClick = checkUpdate
+                    )
+                    if (updateState is UpdateState.Downloading) {
+                        val s = updateState as UpdateState.Downloading
+                        ThinProgressBar(
+                            progress = s.progress.coerceAtLeast(0f),
+                            modifier = Modifier.padding(horizontal = 16.dp, vertical = 6.dp),
+                            height = 4.dp
+                        )
+                    }
                     ListRow(
                         title = "版本",
                         subtitle = "额度哨兵 QuotaSentry",
                         leadingIcon = QsIcon.CODE,
                         trailing = {
                             MText(
-                                text = BuildConfig.VERSION_NAME,
+                                text = UpdateCenter.currentVersion,
                                 color = p.dim,
                                 style = QsType.caption,
                                 maxLines = 1

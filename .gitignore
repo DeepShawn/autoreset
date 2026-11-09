@@ -15,3 +15,7 @@ app/keystore/
 
 # 本地构建日志
 *.log
+
+# 内部协作与真机构建脚本（不公开）
+docs/TEAM_CONTRACT.md
+tools/
