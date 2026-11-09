@@ -139,7 +139,7 @@ fun SettingsScreen(now: Long, onOpenAccount: (ProviderId) -> Unit) {
                         ListRow(
                             title = provider.label,
                             subtitle = when {
-                                !linked -> "未连接 · 点击粘贴 Cookie 或网页登录"
+                                !linked -> "未连接 · 粘贴 Cookie 或 Chrome 授权登录"
                                 account.plan.isNotBlank() -> "已连接 · ${account.plan}" +
                                     if (account.label.isNotBlank()) " · ${account.label}" else ""
                                 else -> "已连接"

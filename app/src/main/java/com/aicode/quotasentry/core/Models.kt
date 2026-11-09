@@ -19,7 +19,7 @@ enum class ProviderId(val key: String, val label: String, val shortLabel: String
     }
 }
 
-/** 用户从浏览器 / 内置网页登录里拿到的凭据。 */
+/** 用户从浏览器 / Chrome OAuth 授权里拿到的凭据。 */
 data class Credentials(
     /** 完整 Cookie 请求头，例如 "sessionKey=...; __cf_bm=..." */
     val cookie: String = "",

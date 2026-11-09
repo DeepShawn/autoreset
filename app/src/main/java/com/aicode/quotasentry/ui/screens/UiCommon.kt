@@ -2,7 +2,6 @@ package com.aicode.quotasentry.ui.screens
 
 import android.app.Activity
 import android.content.Context
-import android.content.Intent
 import android.widget.Toast
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.spring
@@ -108,22 +107,10 @@ fun Context.findActivityOrNull(): Activity? {
     return null
 }
 
-/** 打开内置网页登录。 */
-fun openWebLogin(context: Context, provider: ProviderId) {
-    runCatching {
-        val intent = Intent(context, WebLoginActivity::class.java)
-            .putExtra("provider", provider.key)
-            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-        context.startActivity(intent)
-    }.onFailure {
-        AppToast.show(context, "无法打开网页登录：${it.message ?: "未知错误"}")
-    }
-}
-
 /** 账号相关的写操作：连接、保存 Cookie、断开，全部集中在这里，页面只调用。 */
 object AccountFlow {
 
-    /** 把 Cookie 写进 Store（网页登录抓完 Cookie 后调用）。 */
+    /** 把 Cookie 写进 Store（从剪贴板粘贴 Cookie 后调用）。 */
     fun saveCookie(provider: ProviderId, cookie: String) {
         Store.updateAccount(provider) { account ->
             account.copy(credentials = account.credentials.copy(cookie = cookie.trim()))

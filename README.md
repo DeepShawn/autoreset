@@ -8,14 +8,14 @@
 
 ## 功能
 
-- **三家账号接入**：Claude、ChatGPT、Gemini，支持「粘贴 Cookie」和「内置网页登录」两种方式
+- **三家账号接入**：Claude、ChatGPT、Gemini，支持「粘贴 Cookie」和「Chrome 授权登录」两种方式（无内置浏览器；OAuth token 自动回填）
 - **保活发送**：跟随额度窗口 / 固定间隔 / 每天定时三种计划，到点自动发一条很短的问候
 - **额度看板**：官方接口优先（Claude / ChatGPT），不可用时本地 5 小时滚动窗口估算（Gemini），显示剩余比例、剩余条数、重置倒计时、数据来源
 - **后台常驻**：`specialUse` 前台服务 + 划掉任务不退出 + 开机自启 + 精确闹钟兜底 + 电池优化/自启动引导
 - **代理**：HTTP / SOCKS5，国内网络基本必备
 - **Liquid Glass + MIUIX**：深色优先的液体玻璃界面，三 Tab 丝滑切换，支持浅色与强调色自定义
 - **自动更新**：从本仓库 Release 检查新版本，应用内下载安装（启动时 6 小时一次自动检查）
-- **Claude OAuth 额度**：可选粘贴 Claude Code 的 OAuth 令牌，直接读取官方 5h / 7d 用量；发送消息仍用网页 Cookie
+- **Chrome OAuth 授权**：点一下跳到系统 Chrome，授权后自动把 token 带回 App（Claude 复制授权码自动兑换 / ChatGPT 本地回调自动收）；token 用于官方 5h / 7d 额度，发送消息仍用网页 Cookie
 
 ## 安装
 

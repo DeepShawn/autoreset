@@ -368,7 +368,7 @@ private fun OnboardingCard(hasRules: Boolean, onConnect: () -> Unit) {
             }
         }
         Spacer(Modifier.height(14.dp))
-        StepRow(1, "连接账号", "粘贴 Cookie，或用内置网页登录", done = false)
+        StepRow(1, "连接账号", "粘贴 Cookie，或用 Chrome 授权登录", done = false)
         StepRow(2, "设定计划", "跟随额度窗口重置，自动发一条保活消息", done = hasRules)
         StepRow(3, "允许后台", "关闭电池优化，确保划掉任务栏后仍在守护", done = false)
         Spacer(Modifier.height(14.dp))
