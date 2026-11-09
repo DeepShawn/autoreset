@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">额度哨兵</string>
+    <string name="notif_channel_service">后台保活</string>
+    <string name="notif_channel_alert">发送与额度提醒</string>
+</resources>

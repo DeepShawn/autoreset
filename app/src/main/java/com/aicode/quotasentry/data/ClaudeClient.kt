@@ -1,0 +1,589 @@
+package com.aicode.quotasentry.data
+
+import com.aicode.quotasentry.core.Account
+import com.aicode.quotasentry.core.ConnectResult
+import com.aicode.quotasentry.core.DefaultMessages
+import com.aicode.quotasentry.core.ProviderId
+import com.aicode.quotasentry.core.QuotaFetch
+import com.aicode.quotasentry.core.QuotaPatch
+import com.aicode.quotasentry.core.SendOutcome
+import com.aicode.quotasentry.core.Settings
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import org.json.JSONArray
+import org.json.JSONObject
+import kotlin.math.roundToInt
+
+/**
+ * Claude（claude.ai 网页版）适配器。
+ *
+ * 端点（2025-11 用公开逆向实现核实；接口随时可能变，全部失败可解释，不抛异常）：
+ * - 身份/组织：`GET https://claude.ai/api/organizations` → 数组，取第一个的 `uuid`；
+ *   `capabilities` / `billing_type` 推断 plan。
+ * - 官方额度：`GET https://claude.ai/api/organizations/{org}/usage`
+ *   → `five_hour.{utilization,resets_at}`（utilization 0..100，resets_at 为 RFC3339 字符串）；
+ *   部分账号/版本还会返回 `seven_day`、`limits[]`（kind/percent/severity）、`standard.rate_limit`。
+ *   备用候选：`GET .../rate_limits`（该接口的 resets_at 是 epoch 秒）。
+ * - 发送：先 `POST .../chat_conversations` `{"uuid":<uuid4>,"name":""}` 建会话（短消息会话会被复用，
+ *   进程重启后重建），再 `POST .../chat_conversations/{uuid}/completion`（SSE，读到第一条 data 帧即成功）。
+ *   失败兜底：`POST .../chat_conversations/{uuid}/messages`（旧接口）。
+ *
+ * 不确定性（注释保留，供后续排障）：
+ * - `anthropic-client-*` 指纹头是否必需随账号/地区变化；缺失时可能 403，已在错误文案里提示重新登录。
+ * - usage 的量纲在不同时期出现过 0..100 与 0..1 两种（本文件统一按 >1.5 视为百分数）。
+ * - 会话复用只是「少建会话」的优化，Claude 侧没有删除会话能力，必要时用户可自行清理历史。
+ */
+class ClaudeClient : ProviderClient {
+
+    override val id: ProviderId = ProviderId.CLAUDE
+
+    override suspend fun connect(account: Account, settings: Settings): ConnectResult =
+        withContext(Dispatchers.IO) {
+            try {
+                connectInternal(account, settings)
+            } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                throw cancelled
+            } catch (t: Throwable) {
+                ConnectResult.Fail(HttpEngine.networkErrorText(t))
+            }
+        }
+
+    override suspend fun fetchQuota(account: Account, settings: Settings): QuotaFetch =
+        withContext(Dispatchers.IO) {
+            try {
+                fetchQuotaInternal(account, settings)
+            } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                throw cancelled
+            } catch (t: Throwable) {
+                QuotaFetch.Fail(HttpEngine.networkErrorText(t))
+            }
+        }
+
+    override suspend fun send(
+        account: Account,
+        settings: Settings,
+        message: String
+    ): SendOutcome = withContext(Dispatchers.IO) {
+        try {
+            sendInternal(account, settings, message)
+        } catch (cancelled: kotlinx.coroutines.CancellationException) {
+            throw cancelled
+        } catch (t: Throwable) {
+            SendOutcome(ok = false, detail = HttpEngine.networkErrorText(t))
+        }
+    }
+
+    // ------------------------------------------------------------------ connect
+
+    private fun connectInternal(account: Account, settings: Settings): ConnectResult {
+        val cookie = cookieOf(account)
+        if (cookie.isBlank()) {
+            return ConnectResult.Fail(
+                "未填写 Claude Cookie：请先在浏览器登录 claude.ai，复制包含 sessionKey 的整段 Cookie"
+            )
+        }
+        val engine = HttpEngine(settings.proxy)
+        val org = when (val result = fetchOrganization(engine, account, cookie)) {
+            is Res.Err -> return ConnectResult.Fail(result.message)
+            is Res.Ok -> result.value
+        }
+        // 额度只是「顺便拿」，失败不影响连接结果
+        val patch = when (val quota = fetchUsage(engine, account, cookie, org.uuid)) {
+            is Res.Ok -> quota.value
+            is Res.Err -> null
+        }
+        return ConnectResult.Ok(plan = org.plan, label = org.label, quota = patch)
+    }
+
+    private fun fetchOrganization(
+        engine: HttpEngine,
+        account: Account,
+        cookie: String
+    ): Res<ClaudeOrg> {
+        return when (val result = engine.get(URL_ORGANIZATIONS, headers(account, cookie))) {
+            is HttpResult.Fail -> Res.Err(result.message)
+            is HttpResult.Ok -> {
+                val response = result.response
+                if (!response.ok) {
+                    return Res.Err(
+                        httpFailureText("Claude", response.code, response.body),
+                        response.code == 401
+                    )
+                }
+                val org = parseClaudeOrganizations(response.body)
+                    ?: return Res.Err("Claude 接口返回无法识别（/api/organizations），可能已变更，请稍后重试")
+                ProviderCache.putAll(
+                    id,
+                    mapOf(
+                        KEY_ORG_ID to org.uuid,
+                        KEY_PLAN to org.plan,
+                        KEY_LABEL to org.label
+                    )
+                )
+                Res.Ok(org)
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------ quota
+
+    private fun fetchQuotaInternal(account: Account, settings: Settings): QuotaFetch {
+        val cookie = cookieOf(account)
+        if (cookie.isBlank()) {
+            return QuotaFetch.Fail("未填写 Claude Cookie，无法查询额度", unauthorized = true)
+        }
+        val engine = HttpEngine(settings.proxy)
+        val orgId = when (val org = resolveOrgId(engine, account, cookie)) {
+            is Res.Err -> return QuotaFetch.Fail(org.message, unauthorized = org.unauthorized)
+            is Res.Ok -> org.value
+        }
+        return when (val usage = fetchUsage(engine, account, cookie, orgId)) {
+            is Res.Ok -> QuotaFetch.Ok(usage.value)
+            is Res.Err -> if (usage.unsupported) {
+                QuotaFetch.Unsupported(usage.message)
+            } else {
+                QuotaFetch.Fail(usage.message, unauthorized = usage.unauthorized)
+            }
+        }
+    }
+
+    /**
+     * 依次尝试 `/usage` 与 `/rate_limits`，两个都拿不到结构化数据时给出可解释结果。
+     * 404 视为「该账号没有官方额度视图」→ Unsupported，让 UI 退回本地估算。
+     */
+    private fun fetchUsage(
+        engine: HttpEngine,
+        account: Account,
+        cookie: String,
+        orgId: String
+    ): Res<QuotaPatch> {
+        val now = System.currentTimeMillis()
+        val usageResult = engine.get(
+            "$URL_ORGANIZATIONS/$orgId/usage",
+            headers(account, cookie)
+        )
+        when (usageResult) {
+            is HttpResult.Fail -> return Res.Err(usageResult.message)
+            is HttpResult.Ok -> {
+                val response = usageResult.response
+                if (response.ok) {
+                    parseClaudeUsage(response.body, now)?.let { return Res.Ok(it) }
+                } else if (response.code == 401) {
+                    return Res.Err(
+                        httpFailureText("Claude", response.code, response.body),
+                        unauthorized = true
+                    )
+                } else if (response.code !in intArrayOf(403, 404)) {
+                    return Res.Err(httpFailureText("Claude", response.code, response.body))
+                }
+            }
+        }
+        // 备用候选：rate_limits（epoch 秒）
+        when (val rateResult = engine.get("$URL_ORGANIZATIONS/$orgId/rate_limits", headers(account, cookie))) {
+            is HttpResult.Fail -> return Res.Err(rateResult.message)
+            is HttpResult.Ok -> {
+                val response = rateResult.response
+                if (response.ok) {
+                    parseClaudeUsage(response.body, now)?.let { return Res.Ok(it) }
+                    return Res.Err("Claude 额度接口返回结构无法识别，可能已变更")
+                }
+                if (response.code == 404) {
+                    return Res.Err(
+                        "该 Claude 账号暂未开放官方额度接口（HTTP 404），已改用本地窗口估算",
+                        unsupported = true
+                    )
+                }
+                return Res.Err(
+                    httpFailureText("Claude", response.code, response.body),
+                    unauthorized = response.code == 401
+                )
+            }
+        }
+    }
+
+    private fun resolveOrgId(
+        engine: HttpEngine,
+        account: Account,
+        cookie: String
+    ): Res<String> {
+        ProviderCache.resolve(account, KEY_ORG_ID)?.let { return Res.Ok(it) }
+        return when (val org = fetchOrganization(engine, account, cookie)) {
+            is Res.Err -> Res.Err(org.message, org.unauthorized)
+            is Res.Ok -> Res.Ok(org.value.uuid)
+        }
+    }
+
+    // ------------------------------------------------------------------ send
+
+    private fun sendInternal(
+        account: Account,
+        settings: Settings,
+        message: String
+    ): SendOutcome {
+        val cookie = cookieOf(account)
+        if (cookie.isBlank()) {
+            return SendOutcome(
+                ok = false,
+                detail = "未填写 Claude Cookie，请先在设置里连接账号",
+                unauthorized = true
+            )
+        }
+        val engine = HttpEngine(settings.proxy)
+        val orgId = when (val org = resolveOrgId(engine, account, cookie)) {
+            is Res.Err -> return SendOutcome(false, org.message, org.unauthorized)
+            is Res.Ok -> org.value
+        }
+        val prompt = message.trim().ifEmpty { DefaultMessages.forProvider(ProviderId.CLAUDE) }
+
+        // 1) 复用上次的会话；没有就新建
+        var conversationId = ProviderCache.resolve(account, KEY_CONVERSATION_ID)
+        var freshConversation = false
+        if (conversationId.isNullOrBlank()) {
+            when (val created = createConversation(engine, account, cookie, orgId)) {
+                is Res.Err -> return SendOutcome(false, created.message, created.unauthorized)
+                is Res.Ok -> {
+                    conversationId = created.value
+                    freshConversation = true
+                }
+            }
+        }
+
+        // 2) completion（SSE），必要时重建会话 / 补 parent uuid 再试
+        var attempt = postCompletion(
+            engine, account, cookie, orgId, conversationId,
+            prompt,
+            parentUuid = if (freshConversation) CLAUDE_NULL_PARENT_UUID else null
+        )
+        if (!attempt.ok && attempt.retryWithNewConversation) {
+            ProviderCache.remove(id, KEY_CONVERSATION_ID)
+            when (val created = createConversation(engine, account, cookie, orgId)) {
+                is Res.Err -> return SendOutcome(false, created.message, created.unauthorized)
+                is Res.Ok -> {
+                    conversationId = created.value
+                    freshConversation = true
+                }
+            }
+            attempt = postCompletion(
+                engine, account, cookie, orgId, conversationId,
+                prompt,
+                parentUuid = if (freshConversation) CLAUDE_NULL_PARENT_UUID else null
+            )
+        }
+        if (!attempt.ok && attempt.retryWithParent) {
+            attempt = postCompletion(
+                engine, account, cookie, orgId, conversationId,
+                prompt,
+                parentUuid = CLAUDE_NULL_PARENT_UUID
+            )
+        }
+        if (attempt.ok) {
+            ProviderCache.putAll(
+                id,
+                mapOf(
+                    KEY_CONVERSATION_ID to conversationId,
+                    "lastSendAt" to System.currentTimeMillis().toString()
+                )
+            )
+            return SendOutcome(ok = true, detail = "Claude 已收到消息（SSE 已返回数据）")
+        }
+        if (attempt.unauthorized) {
+            return SendOutcome(false, attempt.message, unauthorized = true)
+        }
+
+        // 3) 旧接口兜底：POST .../messages
+        val legacy = postLegacyMessage(engine, account, cookie, orgId, conversationId, prompt)
+        if (legacy != null) {
+            if (legacy.ok) {
+                ProviderCache.put(id, KEY_CONVERSATION_ID, conversationId)
+                return SendOutcome(ok = true, detail = "Claude 已收到消息（旧接口兜底）")
+            }
+            return SendOutcome(false, legacy.message, legacy.unauthorized)
+        }
+        return SendOutcome(false, attempt.message, attempt.unauthorized)
+    }
+
+    private fun createConversation(
+        engine: HttpEngine,
+        account: Account,
+        cookie: String,
+        orgId: String
+    ): Res<String> {
+        val generated = uuidV4()
+        val body = JSONObject()
+            .put("uuid", generated)
+            .put("name", "")
+            .toString()
+        val requestHeaders = headers(account, cookie) + mapOf("Content-Type" to HttpEngine.CONTENT_TYPE_JSON)
+        return when (val result = engine.postJson("$URL_ORGANIZATIONS/$orgId/chat_conversations", requestHeaders, body)) {
+            is HttpResult.Fail -> Res.Err(result.message)
+            is HttpResult.Ok -> {
+                val response = result.response
+                if (!response.ok) {
+                    Res.Err(
+                        httpFailureText("Claude", response.code, response.body),
+                        response.code == 401
+                    )
+                } else {
+                    val returned = parseJsonObjectLenient(response.body)?.optString("uuid").orEmpty()
+                    val conversationId = returned.ifBlank { generated }
+                    ProviderCache.put(id, KEY_CONVERSATION_ID, conversationId)
+                    Res.Ok(conversationId)
+                }
+            }
+        }
+    }
+
+    private fun postCompletion(
+        engine: HttpEngine,
+        account: Account,
+        cookie: String,
+        orgId: String,
+        conversationId: String,
+        prompt: String,
+        parentUuid: String?
+    ): CompletionAttempt {
+        val url = "$URL_ORGANIZATIONS/$orgId/chat_conversations/$conversationId/completion"
+        val body = JSONObject().apply {
+            put("prompt", prompt)
+            put("timezone", "Asia/Shanghai")
+            put("locale", "zh-CN")
+            put("attachments", JSONArray())
+            put("files", JSONArray())
+            put("rendering_mode", "messages")
+            if (parentUuid != null) put("parent_message_uuid", parentUuid)
+        }.toString()
+        val requestHeaders = headers(account, cookie) + mapOf(
+            "Accept" to "text/event-stream",
+            "Referer" to "https://claude.ai/new"
+        )
+        return when (val result = engine.sse(url, requestHeaders, body, maxLines = 12)) {
+            is HttpResult.Fail -> CompletionAttempt(false, result.message)
+            is HttpResult.Ok -> {
+                val response = result.response
+                if (response.ok) {
+                    val error = sseErrorDetail(response.body)
+                    when {
+                        error != null -> CompletionAttempt(false, "Claude 拒绝了发送：$error")
+                        HttpEngine.sseSampleHasData(response.body) -> CompletionAttempt(true, "")
+                        else -> CompletionAttempt(
+                            false,
+                            "Claude 接口没有返回流数据（可能被风控拦截），请稍后重试"
+                        )
+                    }
+                } else {
+                    CompletionAttempt(
+                        ok = false,
+                        message = httpFailureText("Claude", response.code, response.body),
+                        unauthorized = response.code == 401,
+                        retryWithNewConversation = response.code == 404,
+                        retryWithParent = response.code == 400 && parentUuid == null
+                    )
+                }
+            }
+        }
+    }
+
+    /** 旧接口兜底：`POST .../chat_conversations/{uuid}/messages`。返回 null 表示不适用（本次无需兜底）。 */
+    private fun postLegacyMessage(
+        engine: HttpEngine,
+        account: Account,
+        cookie: String,
+        orgId: String,
+        conversationId: String,
+        prompt: String
+    ): CompletionAttempt? {
+        val url = "$URL_ORGANIZATIONS/$orgId/chat_conversations/$conversationId/messages"
+        val body = JSONObject()
+            .put("prompt", prompt)
+            .put("timezone", "Asia/Shanghai")
+            .toString()
+        val requestHeaders = headers(account, cookie) + mapOf("Content-Type" to HttpEngine.CONTENT_TYPE_JSON)
+        return when (val result = engine.postJson(url, requestHeaders, body)) {
+            is HttpResult.Fail -> CompletionAttempt(false, result.message)
+            is HttpResult.Ok -> {
+                val response = result.response
+                if (response.ok) {
+                    CompletionAttempt(true, "")
+                } else {
+                    CompletionAttempt(
+                        ok = false,
+                        message = httpFailureText("Claude", response.code, response.body),
+                        unauthorized = response.code == 401
+                    )
+                }
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------ 辅助
+
+    private fun cookieOf(account: Account): String =
+        CredentialUtil.claudeCookie(account.credentials.cookie)
+
+    private fun headers(account: Account, cookie: String): Map<String, String> =
+        BrowserHeaders.claude(cookie, deviceId(account, cookie))
+
+    /** anthropic-device-id：优先用 Cookie 里的，其次缓存，最后生成并缓存。 */
+    private fun deviceId(account: Account, cookie: String): String {
+        CredentialUtil.cookieValue(cookie, "anthropic-device-id")
+            ?.takeIf { it.isNotBlank() }
+            ?.let { return it }
+        ProviderCache.resolve(account, KEY_DEVICE_ID)?.let { return it }
+        val generated = uuidV4()
+        ProviderCache.put(id, KEY_DEVICE_ID, generated)
+        return generated
+    }
+
+    private data class CompletionAttempt(
+        val ok: Boolean,
+        val message: String,
+        val unauthorized: Boolean = false,
+        val retryWithNewConversation: Boolean = false,
+        val retryWithParent: Boolean = false
+    )
+
+    private companion object {
+        const val URL_ORGANIZATIONS = "https://claude.ai/api/organizations"
+        const val KEY_ORG_ID = "orgId"
+        const val KEY_PLAN = "plan"
+        const val KEY_LABEL = "label"
+        const val KEY_DEVICE_ID = "deviceId"
+        const val KEY_CONVERSATION_ID = "conversationId"
+    }
+}
+
+// ---------------------------------------------------------------------- 纯解析函数（可单测）
+
+/** 组织信息。 */
+internal data class ClaudeOrg(val uuid: String, val plan: String, val label: String)
+
+/** `GET /api/organizations` 的容错解析：支持数组、`{organizations:[...]}`、单个对象。 */
+internal fun parseClaudeOrganizations(raw: String): ClaudeOrg? {
+    val root = parseJsonLenient(raw) ?: return null
+    val array: JSONArray = when (root) {
+        is JSONArray -> root
+        is JSONObject -> root.optJSONArray("organizations")
+            ?: root.optJSONArray("data")
+            ?: JSONArray().put(root)
+        else -> return null
+    }
+    var org: JSONObject? = null
+    for (index in 0 until array.length()) {
+        val candidate = array.optJSONObject(index) ?: continue
+        if (candidate.optString("uuid").isNotBlank() || candidate.optString("organization_uuid").isNotBlank()) {
+            org = candidate
+            break
+        }
+    }
+    val target = org ?: return null
+    val uuid = target.optString("uuid").ifBlank { target.optString("organization_uuid") }
+    if (uuid.isBlank()) return null
+
+    val capabilities = mutableListOf<String>()
+    target.optJSONArray("capabilities")?.let { arr ->
+        for (index in 0 until arr.length()) {
+            arr.optString(index).takeIf { it.isNotBlank() }?.let { capabilities += it }
+        }
+    }
+    target.optJSONObject("capabilities")?.let { obj ->
+        val keys = obj.keys()
+        while (keys.hasNext()) {
+            val key = keys.next()
+            if (obj.optBoolean(key, false)) capabilities += key
+        }
+    }
+    val billing = target.optString("billing_type")
+        .ifBlank { target.optString("billingType") }
+        .ifBlank { target.optString("subscription_plan") }
+    val plan = inferClaudePlan(capabilities, billing)
+    val label = target.optString("name")
+        .ifBlank { target.optString("display_name") }
+        .ifBlank { target.optString("email") }
+    return ClaudeOrg(uuid = uuid, plan = plan, label = label)
+}
+
+/** 从 capabilities / billing_type 推断计划名；识别不出来就留空（UI 显示「已连接」即可）。 */
+internal fun inferClaudePlan(capabilities: List<String>, billingType: String): String {
+    val text = (capabilities.joinToString(" ") + " " + billingType).lowercase()
+    return when {
+        text.contains("enterprise") -> "Enterprise"
+        text.contains("max") -> "Max"
+        text.contains("team") -> "Team"
+        text.contains("pro") -> "Pro"
+        text.contains("free") -> "Free"
+        else -> ""
+    }
+}
+
+/** 一次官方额度解析结果（纯函数便于单测）。 */
+internal data class ClaudeUsageResult(
+    val usedFraction: Float,
+    val windowMillis: Long,
+    val resetAt: Long?,
+    val detail: String,
+    val plan: String = ""
+)
+
+/**
+ * 容错解析 Claude 额度 JSON（`/usage` 与 `/rate_limits` 两种形态）。
+ *
+ * 策略：
+ * 1. 递归收集所有对象，按 key 路径/kind 关键词挑出「5 小时窗口」与「7 天窗口」；
+ * 2. 优先使用 5 小时窗口；没有则退 7 天窗口；再没有就用第一个带 utilization 的对象；
+ * 3. 量纲：>1.5 视为百分数；重置时刻支持 ISO8601 / epoch 秒 / 毫秒 / reset_after。
+ */
+internal fun parseClaudeUsage(raw: String, now: Long): QuotaPatch? {
+    val root = parseJsonObjectLenient(raw) ?: return null
+    val walked = walkObjects(root)
+
+    fun findWindow(vararg hints: String): WalkedObject? = walked.firstOrNull { walkedObject ->
+        hints.any { walkedObject.hint.contains(it, ignoreCase = true) } &&
+            readUsedFraction(walkedObject.value) != null
+    }
+
+    val five = findWindow("five_hour", "five", "5h", "session", "primary_window", "primary")
+    val seven = findWindow("seven_day", "seven", "7d", "weekly", "secondary_window", "secondary")
+    val generic = walked.firstOrNull { readUsedFraction(it.value) != null }
+    val chosen = five ?: seven ?: generic ?: return null
+    val used = readUsedFraction(chosen.value) ?: return null
+    val isFive = five != null && chosen === five
+    val isSeven = seven != null && chosen === seven
+
+    val defaultWindow = when {
+        isFive -> FIVE_HOURS
+        isSeven -> SEVEN_DAYS
+        chosen.hint.contains("seven") || chosen.hint.contains("weekly") -> SEVEN_DAYS
+        else -> FIVE_HOURS
+    }
+    val window = readWindowMillis(chosen.value) ?: defaultWindow
+    val resetAt = readResetAt(chosen.value, now)
+
+    val details = mutableListOf<String>()
+    details += when {
+        isFive -> "5 小时窗口已用 ${percentText(used)}"
+        isSeven -> "7 天窗口已用 ${percentText(used)}（5 小时窗口暂无数据）"
+        else -> "已用 ${percentText(used)}"
+    }
+    if (seven != null && seven !== chosen) {
+        readUsedFraction(seven.value)?.let { details += "7 天窗口已用 ${percentText(it)}" }
+    }
+    // limits[] 里的 severity（normal/warning/critical）顺带展示
+    walked.mapNotNull { walkedObject ->
+        walkedObject.value.optString("severity").takeIf { it.isNotBlank() && !it.equals("normal", true) }
+    }.firstOrNull()?.let { details += "状态：$it" }
+
+    val plan = extractPlanHint(root)
+    return QuotaPatch(
+        officialUsedFraction = used,
+        officialWindowMillis = window,
+        officialResetAt = resetAt,
+        officialDetail = details.joinToString("；"),
+        plan = plan
+    )
+}
+
+internal fun percentText(fraction: Float): String =
+    "${(fraction.coerceIn(0f, 1f) * 100).roundToInt()}%"
+
+internal const val FIVE_HOURS: Long = 5L * 60 * 60 * 1000
+internal const val SEVEN_DAYS: Long = 7L * 24 * 60 * 60 * 1000
