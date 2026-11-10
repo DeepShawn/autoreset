@@ -1,6 +1,6 @@
 # 额度哨兵 · 使用手册
 
-> 版本 1.4.0 · Android 8.0+（推荐 Android 13 及以上，小米 / HyperOS 机型已做专门适配）
+> 版本 1.5.0 · Android 8.0+（推荐 Android 13 及以上，小米 / HyperOS 机型已做专门适配）
 
 ## 一、这是什么
 
@@ -48,14 +48,13 @@ APK 文件：`额度哨兵/QuotaSentry-1.0.0.apk`（在手机的 `Download/DSH-G
 
 > Cookie 等价于登录态，**不要发给任何人**、不要截图发群里。失效后在浏览器重新登录、重新复制即可。
 
-### 方式 B：Chrome 授权登录（Claude / ChatGPT）
+### 方式 B：OAuth 授权（Claude / ChatGPT，推荐）
 
-不再使用应用内浏览器，点「Chrome 授权登录」会直接跳到系统 Chrome：
+连接方式与 QQBot 相同：用 OAuth token 直接调用官方 CLI 接口，不需要网页 Cookie、也不受 claude.ai 的 Cloudflare 风控影响。点「Chrome 授权登录」会跳到系统 Chrome：
 
-- **Claude**：在 Chrome 里登录并允许授权 → 页面会显示一段授权码 → **复制它**，切回额度哨兵；
-  App 回到前台会自动读取剪贴板完成兑换（也可以点面板里的「已复制授权码？点此读取」）。
-  授权码很短命，看到后尽快返回。
-- **ChatGPT**：在 Chrome 里登录并授权 → 浏览器跳到本地回调页显示「授权成功」→ App 自动收下 token，无需复制。
+- **Claude**：在 Chrome 里登录并允许授权 → 会自动跳到 `localhost:53692` 显示「授权成功」→ 回到 App 自动完成连接。
+  如果面板提示「复制授权码」，说明本地端口被占用：复制页面上的 `code#state`，回 App 会自动读剪贴板。
+- **ChatGPT**：使用**设备码**：App 显示 8 位验证码 → 打开 `auth.openai.com/codex/device` 输入 → App 自动轮询完成，全程不用复制 Cookie。
 
 成功后面板会显示「已连接」和计划名，额度改走官方 OAuth 接口（Claude 还能看到 7 天窗口）。
 

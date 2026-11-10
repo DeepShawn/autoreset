@@ -9,10 +9,10 @@ class OAuthFlowTest {
 
     @Test
     fun `claude authorize url carries pkce and hosted redirect`() {
-        val url = OAuthFlow.buildClaudeAuthorizeUrl("CHALLENGE", "STATE123")
-        assertTrue(url.startsWith("https://platform.claude.com/oauth/authorize?"))
+        val url = OAuthFlow.buildClaudeAuthorizeUrl("CHALLENGE", "STATE123", "http://localhost:53692/callback")
+        assertTrue(url.startsWith("https://claude.ai/oauth/authorize?"))
         assertTrue(url.contains("client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e"))
-        assertTrue(url.contains("redirect_uri=https%3A%2F%2Fplatform.claude.com%2Foauth%2Fcode%2Fcallback"))
+        assertTrue(url.contains("redirect_uri=http%3A%2F%2Flocalhost%3A53692%2Fcallback"))
         assertTrue(url.contains("code_challenge=CHALLENGE"))
         assertTrue(url.contains("code_challenge_method=S256"))
         assertTrue(url.contains("state=STATE123"))
@@ -29,7 +29,7 @@ class OAuthFlowTest {
         assertTrue(url.contains("redirect_uri=http%3A%2F%2F127.0.0.1%3A1455%2Fauth%2Fcallback"))
         assertTrue(url.contains("code_challenge_method=S256"))
         assertTrue(url.contains("scope=openid%20profile%20email%20offline_access%20api.connectors.read%20api.connectors.invoke"))
-        assertTrue(url.contains("originator=codex_cli_rs"))
+        assertTrue(url.contains("originator=pi"))
         assertTrue(url.contains("codex_cli_simplified_flow=true"))
     }
 

@@ -36,6 +36,14 @@ import java.util.Random
  *   如果返回 `proofofwork` 则本地算 proof token（SHA3-512，见 [generateProofToken]）；
  *   `/backend-api/f/conversation/prepare` 可换 `conduit_token`（失败可忽略）。
  *
+ * OAuth 方式（QQBot 同款，优先于网页 Cookie）：
+ * - 发送：`POST https://chatgpt.com/backend-api/codex/responses`（SSE，Bearer + chatgpt-account-id +
+ *   `OpenAI-Beta: responses=experimental` + `originator: pi`），模型 gpt-6.1-sol，
+ *   被拒时回退 gpt-5.6-sol / gpt-5.6-luna，仍失败再回退网页 conversation。
+ * - 刷新：`POST https://auth.openai.com/oauth/token`（grant_type=refresh_token，client_id
+ *   app_EMoamEEZ73f0CkXaXp7hrann），写回 accessToken / extra["refreshToken"] /
+ *   extra["oauthExpiresAt"]（expires_in-60s）。accountId 从新 access JWT 重新解析。
+ *
  * 不确定性（注释保留）：
  * - 网页版把「对话发送」升级成了带 sentinel/PoW 的流程，且新旧端点并存；
  *   本适配器先用新端点（带 sentinel），失败再回退旧端点，两者都失败才报错。
@@ -85,21 +93,31 @@ class ChatGPTClient : ProviderClient {
     // ------------------------------------------------------------------ connect
 
     private fun connectInternal(account: Account, settings: Settings): ConnectResult {
-        val credential = when (val resolved = resolveCredential(account, settings)) {
+        var current = freshenChatGptAccount(account, settings)
+        var credential = when (val resolved = resolveCredential(current, settings)) {
             is Res.Err -> return ConnectResult.Fail(resolved.message)
             is Res.Ok -> resolved.value
         }
+        var usage = fetchUsage(current, settings, credential)
+        if (usage is Res.Err && usage.unauthorized) {
+            val refreshed = refreshChatGptOAuthToken(HttpEngine(settings.proxy), current)
+            if (refreshed is Res.Ok) {
+                current = refreshed.value
+                credential = when (val resolved = resolveCredential(current, settings)) {
+                    is Res.Err -> credential
+                    is Res.Ok -> resolved.value
+                }
+                usage = fetchUsage(current, settings, credential)
+            }
+        }
         val claims = parseChatGptClaims(credential.accessToken)
         val planFromToken = claims?.plan.orEmpty()
-        val usagePatch = when (val usage = fetchUsage(account, settings, credential)) {
-            is Res.Ok -> usage.value
-            is Res.Err -> null
-        }
+        val usagePatch = (usage as? Res.Ok)?.value
         val plan = usagePatch?.plan?.takeIf { it.isNotBlank() }
             ?: planFromToken
-            ?: planLabel(ProviderCache.resolve(account, KEY_PLAN).orEmpty())
+            ?: planLabel(ProviderCache.resolve(current, KEY_PLAN).orEmpty())
         val label = claims?.email.orEmpty()
-            .ifBlank { ProviderCache.resolve(account, KEY_EMAIL).orEmpty() }
+            .ifBlank { ProviderCache.resolve(current, KEY_EMAIL).orEmpty() }
         ProviderCache.putAll(
             id,
             mapOf(KEY_PLAN to plan, KEY_EMAIL to label, KEY_ACCOUNT_ID to claims?.accountId)
@@ -110,7 +128,8 @@ class ChatGPTClient : ProviderClient {
     // ------------------------------------------------------------------ quota
 
     private fun fetchQuotaInternal(account: Account, settings: Settings): QuotaFetch {
-        val credential = when (val resolved = resolveCredential(account, settings)) {
+        var current = freshenChatGptAccount(account, settings)
+        var credential = when (val resolved = resolveCredential(current, settings)) {
             is Res.Err -> return if (resolved.unauthorized) {
                 QuotaFetch.Fail(resolved.message, unauthorized = true)
             } else {
@@ -118,7 +137,19 @@ class ChatGPTClient : ProviderClient {
             }
             is Res.Ok -> resolved.value
         }
-        return when (val usage = fetchUsage(account, settings, credential)) {
+        var usage = fetchUsage(current, settings, credential)
+        if (usage is Res.Err && usage.unauthorized) {
+            val refreshed = refreshChatGptOAuthToken(HttpEngine(settings.proxy), current)
+            if (refreshed is Res.Ok) {
+                current = refreshed.value
+                credential = when (val resolved = resolveCredential(current, settings)) {
+                    is Res.Err -> credential
+                    is Res.Ok -> resolved.value
+                }
+                usage = fetchUsage(current, settings, credential)
+            }
+        }
+        return when (usage) {
             is Res.Ok -> QuotaFetch.Ok(usage.value)
             is Res.Err -> if (usage.unsupported) {
                 QuotaFetch.Unsupported(usage.message)
@@ -175,6 +206,33 @@ class ChatGPTClient : ProviderClient {
     // ------------------------------------------------------------------ send
 
     private fun sendInternal(
+        account: Account,
+        settings: Settings,
+        message: String
+    ): SendOutcome {
+        // 1) 有 OAuth token：优先走 Codex /responses（QQBot 同款）
+        if (OAuthCredentialStore.accessToken(account).isNotBlank()) {
+            val codex = sendViaCodex(account, settings, message)
+            if (codex.ok) return SendOutcome(true, codex.message)
+            // 2) Codex 失败：有 Cookie 时回退网页 conversation 流程
+            val (webCookie, _) = CredentialUtil.chatGptCredential(account.credentials.cookie)
+            if (webCookie.isBlank()) {
+                return SendOutcome(false, codex.message, codex.unauthorized)
+            }
+            val web = sendViaWeb(account, settings, message)
+            if (web.ok) return web
+            return SendOutcome(
+                ok = false,
+                detail = "OAuth：${codex.message}；网页：${web.detail}",
+                unauthorized = codex.unauthorized || web.unauthorized
+            )
+        }
+        // 3) 没有 token：保持原来的网页 Cookie 流程
+        return sendViaWeb(account, settings, message)
+    }
+
+    /** 网页版 conversation 发送（Cookie/sentinel 流程，原有实现）。 */
+    private fun sendViaWeb(
         account: Account,
         settings: Settings,
         message: String
@@ -243,6 +301,192 @@ class ChatGPTClient : ProviderClient {
         }
         return SendOutcome(false, attempt.message.ifBlank { legacy.message })
     }
+
+    /** 快过期时先刷新（失败不抛异常，交给后续 401 判断）。 */
+    private fun freshenChatGptAccount(account: Account, settings: Settings): Account {
+        if (OAuthCredentialStore.refreshToken(account).isBlank()) return account
+        if (!OAuthCredentialStore.isExpiring(
+                account,
+                System.currentTimeMillis(),
+                CHATGPT_REFRESH_MARGIN_MS
+            )
+        ) {
+            return account
+        }
+        return when (val refreshed = refreshChatGptOAuthToken(HttpEngine(settings.proxy), account)) {
+            is Res.Ok -> refreshed.value
+            is Res.Err -> account
+        }
+    }
+
+    /**
+     * 用 refresh token 换新 access token（auth.openai.com）。
+     * 表单为主（契约要求）；个别部署只吃 JSON body，表单 4xx 时再试一次 JSON。
+     */
+    private fun refreshChatGptOAuthToken(engine: HttpEngine, account: Account): Res<Account> {
+        val refreshToken = OAuthCredentialStore.refreshToken(account)
+        if (refreshToken.isBlank()) {
+            return Res.Err("OAuth 令牌已过期且没有 refresh token，请重新登录 ChatGPT", unauthorized = true)
+        }
+        val fields = mapOf(
+            "grant_type" to "refresh_token",
+            "client_id" to OPENAI_OAUTH_CLIENT_ID,
+            "refresh_token" to refreshToken
+        )
+        val headers = mapOf(
+            "Accept" to "application/json",
+            "User-Agent" to HttpEngine.DEFAULT_USER_AGENT
+        )
+        var response = when (val result = engine.postForm(CHATGPT_OAUTH_TOKEN_URL, headers, fields)) {
+            is HttpResult.Fail -> return Res.Err(result.message)
+            is HttpResult.Ok -> result.response
+        }
+        if (!response.ok && response.code in intArrayOf(400, 401, 415, 422)) {
+            val jsonBody = JSONObject()
+                .put("grant_type", "refresh_token")
+                .put("client_id", OPENAI_OAUTH_CLIENT_ID)
+                .put("refresh_token", refreshToken)
+                .toString()
+            val jsonHeaders = headers + mapOf("Content-Type" to HttpEngine.CONTENT_TYPE_JSON)
+            response = when (val result = engine.postJson(CHATGPT_OAUTH_TOKEN_URL, jsonHeaders, jsonBody)) {
+                is HttpResult.Fail -> return Res.Err(result.message)
+                is HttpResult.Ok -> result.response
+            }
+        }
+        if (!response.ok) {
+            return Res.Err(
+                if (response.code == 429) {
+                    "ChatGPT OAuth 刷新过于频繁（HTTP 429），稍后再试"
+                } else {
+                    httpFailureText("ChatGPT OAuth", response.code, response.body)
+                },
+                unauthorized = response.code in intArrayOf(400, 401, 403)
+            )
+        }
+        val tokens = parseOAuthTokenResponse(response.body)
+            ?: return Res.Err("ChatGPT OAuth 刷新响应无法识别，请重新登录")
+        val claims = parseChatGptClaims(tokens.accessToken)
+        val extra = buildMap {
+            claims?.accountId?.takeIf { it.isNotBlank() }?.let {
+                put(OAuthCredentialStore.KEY_ACCOUNT_ID, it)
+            }
+            claims?.plan?.takeIf { it.isNotBlank() }?.let { put(KEY_PLAN, it) }
+            claims?.email?.takeIf { it.isNotBlank() }?.let { put(KEY_EMAIL, it) }
+        }
+        val updated = OAuthCredentialStore.applyTokens(
+            account,
+            tokens,
+            System.currentTimeMillis(),
+            CHATGPT_REFRESH_MARGIN_MS,
+            extra
+        )
+        OAuthCredentialStore.persist(account, updated)
+        return Res.Ok(updated)
+    }
+
+    /** 用 Codex OAuth token 发保活消息；模型被拒自动回退，401/403 先刷新再重试一次。 */
+    private fun sendViaCodex(account: Account, settings: Settings, message: String): CodexAttempt {
+        val prompt = message.trim().ifEmpty { DefaultMessages.forProvider(ProviderId.CHATGPT) }
+        val engine = HttpEngine(settings.proxy)
+        var current = freshenChatGptAccount(account, settings)
+        var attempt = attemptCodexAllModels(engine, current, prompt)
+        if (!attempt.ok && attempt.unauthorized) {
+            when (val refreshed = refreshChatGptOAuthToken(engine, current)) {
+                is Res.Ok -> {
+                    current = refreshed.value
+                    attempt = attemptCodexAllModels(engine, current, prompt)
+                }
+                is Res.Err -> return CodexAttempt(
+                    ok = false,
+                    message = "ChatGPT OAuth 令牌已失效且刷新失败：${refreshed.message}",
+                    unauthorized = true
+                )
+            }
+        }
+        return attempt
+    }
+
+    private fun attemptCodexAllModels(
+        engine: HttpEngine,
+        account: Account,
+        prompt: String
+    ): CodexAttempt {
+        val accessToken = OAuthCredentialStore.accessToken(account)
+        if (accessToken.isBlank()) {
+            return CodexAttempt(false, "缺少 ChatGPT OAuth access token", unauthorized = true)
+        }
+        val claims = parseChatGptClaims(accessToken)
+        val accountId = account.credentials.extra[OAuthCredentialStore.KEY_ACCOUNT_ID]
+            ?.takeIf { it.isNotBlank() }
+            ?: claims?.accountId?.takeIf { it.isNotBlank() }
+            ?: return CodexAttempt(false, "ChatGPT 账号信息不完整（缺少 account id），请重新登录")
+        var last = CodexAttempt(false, "ChatGPT Codex 接口未返回结果")
+        for (model in CODEX_MODEL_FALLBACKS) {
+            val attempt = postCodexResponses(engine, accessToken, accountId, model, prompt)
+            if (attempt.ok) return attempt
+            last = attempt
+            if (attempt.unauthorized) return attempt
+            // 只有「模型被拒」才换下一个模型；其它错误直接返回
+            if (!attempt.modelRejected) return attempt
+        }
+        return last
+    }
+
+    private fun postCodexResponses(
+        engine: HttpEngine,
+        accessToken: String,
+        accountId: String,
+        model: String,
+        prompt: String
+    ): CodexAttempt {
+        val body = buildCodexResponsesBody(model, prompt)
+        val headers = codexResponsesHeaders(accessToken, accountId)
+        return when (val result = engine.sse(CODEX_RESPONSES_URL, headers, body, maxLines = 12)) {
+            is HttpResult.Fail -> CodexAttempt(false, result.message)
+            is HttpResult.Ok -> {
+                val response = result.response
+                if (response.ok) {
+                    val sseError = chatGptSseError(response.body)
+                    when {
+                        sseError != null -> CodexAttempt(
+                            ok = false,
+                            message = "ChatGPT Codex 拒绝了请求：$sseError",
+                            model = model,
+                            modelRejected = isModelRejected(400, sseError)
+                        )
+                        HttpEngine.sseSampleHasData(response.body) -> CodexAttempt(true, "", model = model)
+                        else -> CodexAttempt(
+                            ok = false,
+                            message = "ChatGPT Codex 接口没有返回流数据（可能被风控拦截）",
+                            model = model
+                        )
+                    }
+                } else {
+                    val detail = apiErrorDetail(response.body)
+                    val message = when (response.code) {
+                        429 -> "ChatGPT 额度用尽或请求过于频繁（HTTP 429），稍后再试"
+                        else -> detail?.let { "ChatGPT Codex 请求失败（HTTP ${response.code}）：$it" }
+                            ?: chatGptFailureText(response.code, response.body)
+                    }
+                    CodexAttempt(
+                        ok = false,
+                        message = message,
+                        unauthorized = response.code == 401 || response.code == 403,
+                        model = model,
+                        modelRejected = isModelRejected(response.code, response.body)
+                    )
+                }
+            }
+        }
+    }
+
+    private data class CodexAttempt(
+        val ok: Boolean,
+        val message: String,
+        val unauthorized: Boolean = false,
+        val model: String = "",
+        val modelRejected: Boolean = false
+    )
 
     private fun postConversation(
         engine: HttpEngine,
@@ -756,3 +1000,72 @@ private val PROOF_REACT_KEYS = listOf(
     "_reactListening410nzwhan2a"
 )
 private val PROOF_EVENTS = listOf("alert", "ontransitionend", "onprogress")
+
+
+// ---------------------------------------------------------------------- ChatGPT Codex OAuth 协议
+
+internal const val CODEX_RESPONSES_URL = "https://chatgpt.com/backend-api/codex/responses"
+internal const val CHATGPT_OAUTH_TOKEN_URL = "https://auth.openai.com/oauth/token"
+internal const val OPENAI_OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
+internal const val CODEX_ORIGINATOR = "pi"
+
+/** 与 QQBot / pi-ai 一致：提前 60 秒视为过期。 */
+internal const val CHATGPT_REFRESH_MARGIN_MS = 60L * 1000L
+
+/** 契约要求的模型回退顺序：主模型被拒时依次降级。 */
+internal val CODEX_MODEL_FALLBACKS = listOf("gpt-6.1-sol", "gpt-5.6-sol", "gpt-5.6-luna")
+
+/** 构造 Codex `/responses` 保活请求体（契约给定形态）。 */
+internal fun buildCodexResponsesBody(model: String, message: String): String = JSONObject().apply {
+    put("model", model)
+    put("store", false)
+    put("stream", true)
+    put("instructions", "You are a helpful assistant.")
+    put(
+        "input",
+        JSONArray().put(
+            JSONObject().apply {
+                put("type", "message")
+                put("role", "user")
+                put(
+                    "content",
+                    JSONArray().put(
+                        JSONObject()
+                            .put("type", "input_text")
+                            .put("text", message)
+                    )
+                )
+            }
+        )
+    )
+    put("text", JSONObject().put("verbosity", "low"))
+    put("include", JSONArray().put("reasoning.encrypted_content"))
+    put("tool_choice", "auto")
+    put("parallel_tool_calls", true)
+}.toString()
+
+/** Codex OAuth 请求头（account id 从 extra 或 access JWT 取）。 */
+internal fun codexResponsesHeaders(accessToken: String, accountId: String): Map<String, String> = mapOf(
+    "Authorization" to "Bearer $accessToken",
+    "chatgpt-account-id" to accountId,
+    "OpenAI-Beta" to "responses=experimental",
+    "originator" to CODEX_ORIGINATOR,
+    "accept" to "text/event-stream",
+    "content-type" to "application/json",
+    "User-Agent" to HttpEngine.DEFAULT_USER_AGENT
+)
+
+/** 判断错误是否属于「当前模型不可用」，用于切换回退模型。 */
+internal fun isModelRejected(code: Int, body: String): Boolean {
+    if (code != 400 && code != 404) return false
+    val lower = body.lowercase()
+    val mentionsModel = lower.contains("model")
+    val rejection = lower.contains("not found") ||
+        lower.contains("unsupported") ||
+        lower.contains("not supported") ||
+        lower.contains("does not exist") ||
+        lower.contains("unknown model") ||
+        lower.contains("invalid model") ||
+        lower.contains("model_not_found")
+    return mentionsModel && rejection
+}

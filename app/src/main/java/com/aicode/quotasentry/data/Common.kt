@@ -2,6 +2,7 @@ package com.aicode.quotasentry.data
 
 import com.aicode.quotasentry.core.Account
 import com.aicode.quotasentry.core.ProviderId
+import com.aicode.quotasentry.core.Store
 import org.json.JSONObject
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
@@ -245,6 +246,169 @@ internal fun sseErrorDetail(sample: String): String? {
         }
         val detail = json.optString("detail")
         if (detail.isNotBlank()) return detail
+    }
+    return null
+}
+
+
+// ---------------------------------------------------------------------- OAuth token 工具
+
+/** OAuth token 端点返回体（Claude / OpenAI 通用字段）。 */
+internal data class OAuthTokenSet(
+    val accessToken: String,
+    val refreshToken: String = "",
+    val expiresInSeconds: Long = 0L
+)
+
+/**
+ * 解析 `{access_token, refresh_token, expires_in}` 形态的刷新响应。
+ * 字段名同时兼容 camelCase；expires_in 兼容数字/字符串；缺 access_token 返回 null。
+ */
+internal fun parseOAuthTokenResponse(raw: String): OAuthTokenSet? {
+    val root = parseJsonObjectLenient(raw) ?: return null
+    val access = root.optString("access_token")
+        .ifBlank { root.optString("accessToken") }
+        .trim()
+    if (access.isBlank()) return null
+    val refresh = root.optString("refresh_token")
+        .ifBlank { root.optString("refreshToken") }
+        .trim()
+    val expiresIn = when (val value = root.opt("expires_in") ?: root.opt("expiresIn")) {
+        is Number -> value.toLong()
+        is String -> value.trim().toFloatOrNull()?.toLong() ?: 0L
+        else -> 0L
+    }
+    return OAuthTokenSet(
+        accessToken = access,
+        refreshToken = refresh,
+        expiresInSeconds = expiresIn.coerceAtLeast(0L)
+    )
+}
+
+/**
+ * OAuth 凭据读写约定（与 Lead 的 auth/OAuthFlow 对齐）：
+ * - access token 存在 `Credentials.accessToken`；
+ * - refresh token 存在 `Credentials.extra["refreshToken"]`；
+ * - 过期时刻存在 `Credentials.extra["oauthExpiresAt"]`（epoch ms，已扣除提前量）。
+ *
+ * 刷新成功后通过 [Store.updateAccountById] 写回，后台/UI 都能立刻读到新 token。
+ */
+internal object OAuthCredentialStore {
+
+    const val KEY_REFRESH_TOKEN = "refreshToken"
+    const val KEY_EXPIRES_AT = "oauthExpiresAt"
+    const val KEY_ACCOUNT_ID = "accountId"
+
+    fun accessToken(account: Account): String = account.credentials.accessToken.trim()
+
+    fun refreshToken(account: Account): String =
+        account.credentials.extra[KEY_REFRESH_TOKEN]?.trim().orEmpty()
+
+    fun expiresAt(account: Account): Long =
+        account.credentials.extra[KEY_EXPIRES_AT]?.trim()?.toLongOrNull() ?: 0L
+
+    /** 是否快过期（提前 [marginMillis] 视为过期）。没有过期时间返回 false，交给接口 401 判断。 */
+    fun isExpiring(account: Account, now: Long, marginMillis: Long): Boolean {
+        val expiresAt = expiresAt(account)
+        return expiresAt > 0L && expiresAt - now <= marginMillis
+    }
+
+    /** 用刷新结果生成新 Account（纯函数，不写 Store）。refresh 缺失时保留旧值。 */
+    fun applyTokens(
+        account: Account,
+        tokens: OAuthTokenSet,
+        now: Long,
+        marginMillis: Long,
+        extra: Map<String, String> = emptyMap()
+    ): Account {
+        val refreshToken = tokens.refreshToken.ifBlank { refreshToken(account) }
+        val expiresAt = if (tokens.expiresInSeconds > 0L) {
+            now + tokens.expiresInSeconds * 1000L - marginMillis
+        } else {
+            expiresAt(account)
+        }
+        val newExtra = buildMap {
+            putAll(account.credentials.extra)
+            if (refreshToken.isNotBlank()) put(KEY_REFRESH_TOKEN, refreshToken)
+            if (expiresAt > 0L) put(KEY_EXPIRES_AT, expiresAt.toString())
+            putAll(extra.filterValues { it.isNotBlank() })
+        }
+        return account.copy(
+            credentials = account.credentials.copy(
+                accessToken = tokens.accessToken,
+                extra = newExtra
+            )
+        )
+    }
+
+    /** 写回 Store（按 account.id）；Store 未初始化或账号不存在时返回 updated，不抛异常。 */
+    fun persist(account: Account, updated: Account): Account =
+        runCatching {
+            Store.updateAccountById(account.id) { current ->
+                current.copy(credentials = updated.credentials)
+            }
+        }.getOrNull() ?: updated
+}
+
+// ---------------------------------------------------------------------- 接口错误解析
+
+/** 从错误响应体里提取可读错误信息（Claude / OpenAI / 通用 JSON）。 */
+internal fun apiErrorDetail(body: String): String? {
+    val text = body.trim()
+    if (text.isEmpty()) return null
+    val json = parseJsonObjectLenient(text) ?: return null
+    val error = json.opt("error")
+    when (error) {
+        is String -> if (error.isNotBlank()) return error
+        is JSONObject -> {
+            val message = error.optString("message")
+                .ifBlank { error.optString("detail") }
+                .ifBlank { error.optString("type") }
+            if (message.isNotBlank()) return message
+        }
+    }
+    for (key in listOf("detail", "message")) {
+        val value = json.opt(key)
+        if (value is String && value.isNotBlank()) return value
+    }
+    return null
+}
+
+/**
+ * Claude `/v1/messages` 结果判定：返回 null 表示成功，否则是中文失败原因。
+ * 保活只关心「消息被接受」，不读回复内容。
+ */
+internal fun claudeMessagesFailure(code: Int, body: String): String? {
+    if (code in 200..299) {
+        // 正常情况下 200 就是成功；若返回体明确是 error 结构，仍按失败处理
+        val detail = apiErrorDetail(body)
+        val looksLikeError = body.contains("\"type\"") && body.contains("\"error\"")
+        return if (detail != null && looksLikeError) detail else null
+    }
+    if (code == 429) {
+        return "Claude 额度已用尽或请求过于频繁（HTTP 429），稍后再试"
+    }
+    return apiErrorDetail(body) ?: httpFailureText("Claude", code, body)
+}
+
+/** ChatGPT Codex SSE：从 `error` / `response.failed` 帧里提取错误信息。 */
+internal fun chatGptSseError(sample: String): String? {
+    for (payload in sseDataPayloads(sample)) {
+        val json = parseJsonObjectLenient(payload) ?: continue
+        when (json.optString("type")) {
+            "error" -> {
+                val message = apiErrorDetail(payload)
+                    ?: json.optString("message")
+                    ?: json.optString("code")
+                if (message.isNotBlank()) return message
+            }
+            "response.failed" -> {
+                val response = json.optJSONObject("response")
+                val error = response?.optJSONObject("error")?.optString("message")
+                if (!error.isNullOrBlank()) return error
+                return "ChatGPT 没有完成响应（response.failed）"
+            }
+        }
     }
     return null
 }

@@ -23,7 +23,14 @@ import kotlin.math.roundToInt
  * - Claude Code OAuth 额度：`GET https://api.anthropic.com/api/oauth/usage`
  *   （Bearer access token + `anthropic-beta: oauth-2025-04-20`；响应同样是
  *   `five_hour.{utilization 0..100, resets_at RFC3339}`，另有 `seven_day`）。
- *   只要导入 token（`Credentials.accessToken`）即可连接/查额度；发送消息仍需 claude.ai Cookie。
+ *   只要导入 token（`Credentials.accessToken`）即可连接/查额度。
+ * - 发送（QQBot 同款，OAuth 优先）：`POST https://api.anthropic.com/v1/messages`
+ *   （Bearer + Claude Code 身份头 `anthropic-beta: claude-code-20250219,oauth-2025-04-20`、
+ *   `user-agent: claude-cli/2.1.280`、`x-app: cli`，model `claude-haiku-5-5`、max_tokens 32）；
+ *   200 即成功。没有 accessToken 时才回退网页 Cookie 发送。
+ * - token 刷新：`POST https://platform.claude.com/v1/oauth/token`（429/5xx 依次回退
+ *   api.anthropic.com / console.anthropic.com），refresh token 存 `Credentials.extra["refreshToken"]`，
+ *   过期时间存 `extra["oauthExpiresAt"]`（提前 5 分钟视为过期）。
  * - 网页版官方额度：`GET https://claude.ai/api/organizations/{org}/usage`
  *   → `five_hour.{utilization,resets_at}`（utilization 0..100，resets_at 为 RFC3339 字符串）；
  *   部分账号/版本还会返回 `seven_day`、`limits[]`（kind/percent/severity）、`standard.rate_limit`。
@@ -90,12 +97,12 @@ class ClaudeClient : ProviderClient {
         }
         val engine = HttpEngine(settings.proxy)
 
-        // 1) OAuth 令牌：优先用它验证并取官方额度
+        // 1) OAuth 令牌：优先用它验证并取官方额度（快过期/401 会自动 refresh 一次）
         var oauthPatch: QuotaPatch? = null
         var oauthError: Res.Err? = null
         if (token.isNotBlank()) {
-            when (val oauth = fetchOAuthUsage(engine, token)) {
-                is Res.Ok -> oauthPatch = oauth.value
+            when (val oauth = fetchOAuthQuota(engine, account)) {
+                is Res.Ok -> oauthPatch = oauth.value.second
                 is Res.Err -> oauthError = oauth
             }
         }
@@ -172,11 +179,11 @@ class ClaudeClient : ProviderClient {
         }
         val engine = HttpEngine(settings.proxy)
 
-        // 1) OAuth 优先：只导入 token 也能查官方额度
+        // 1) OAuth 优先：只导入 token 也能查官方额度（快过期/401 会自动 refresh 一次）
         var oauthError: Res.Err? = null
         if (token.isNotBlank()) {
-            when (val oauth = fetchOAuthUsage(engine, token)) {
-                is Res.Ok -> return QuotaFetch.Ok(oauth.value)
+            when (val oauth = fetchOAuthQuota(engine, account)) {
+                is Res.Ok -> return QuotaFetch.Ok(oauth.value.second)
                 is Res.Err -> oauthError = oauth
             }
         }
@@ -305,6 +312,100 @@ class ClaudeClient : ProviderClient {
         }
     }
 
+    /** 快过期时先刷新；刷新失败不抛异常，交给后续接口的 401 再判断。 */
+    private fun freshenAccount(engine: HttpEngine, account: Account): Account {
+        if (!OAuthCredentialStore.isExpiring(
+                account,
+                System.currentTimeMillis(),
+                CLAUDE_REFRESH_MARGIN_MS
+            )
+        ) {
+            return account
+        }
+        return when (val refreshed = refreshAccountToken(engine, account)) {
+            is Res.Ok -> refreshed.value
+            is Res.Err -> account
+        }
+    }
+
+    /** 查 Claude Code OAuth 额度；401/403 时先 refresh 再重试一次。返回 (最新 account, patch)。 */
+    private fun fetchOAuthQuota(engine: HttpEngine, account: Account): Res<Pair<Account, QuotaPatch>> {
+        var current = freshenAccount(engine, account)
+        var result = fetchOAuthUsage(engine, OAuthCredentialStore.accessToken(current))
+        if (result is Res.Err && result.unauthorized) {
+            when (val refreshed = refreshAccountToken(engine, current)) {
+                is Res.Ok -> {
+                    current = refreshed.value
+                    result = fetchOAuthUsage(engine, OAuthCredentialStore.accessToken(current))
+                }
+                is Res.Err -> return Res.Err(
+                    "${result.message}；刷新失败：${refreshed.message}",
+                    unauthorized = true
+                )
+            }
+        }
+        return when (result) {
+            is Res.Ok -> Res.Ok(current to result.value)
+            is Res.Err -> Res.Err(result.message, result.unauthorized, result.unsupported)
+        }
+    }
+
+    /**
+     * 用 refresh token 换新 access token。
+     * 主域名 429/5xx 时依次回退备用域名（与 QQBot 的 pi-ai 移植实现一致）；
+     * 4xx（refresh token 本身失效）不再重试其它域名。
+     */
+    private fun refreshAccountToken(engine: HttpEngine, account: Account): Res<Account> {
+        val refreshToken = OAuthCredentialStore.refreshToken(account)
+        if (refreshToken.isBlank()) {
+            return Res.Err("OAuth 令牌已过期且没有 refresh token，请重新登录 Claude Code", unauthorized = true)
+        }
+        val body = JSONObject()
+            .put("grant_type", "refresh_token")
+            .put("client_id", CLAUDE_OAUTH_CLIENT_ID)
+            .put("refresh_token", refreshToken)
+            .toString()
+        val headers = mapOf(
+            "Content-Type" to HttpEngine.CONTENT_TYPE_JSON,
+            "Accept" to "application/json",
+            "User-Agent" to HttpEngine.DEFAULT_USER_AGENT
+        )
+        var lastMessage = ""
+        for (url in CLAUDE_TOKEN_URLS) {
+            when (val result = engine.postJson(url, headers, body)) {
+                is HttpResult.Fail -> {
+                    lastMessage = result.message
+                    continue
+                }
+                is HttpResult.Ok -> {
+                    val response = result.response
+                    if (response.ok) {
+                        val tokens = parseOAuthTokenResponse(response.body)
+                            ?: return Res.Err("Claude OAuth 刷新响应无法识别，请重新登录")
+                        val updated = OAuthCredentialStore.applyTokens(
+                            account,
+                            tokens,
+                            System.currentTimeMillis(),
+                            CLAUDE_REFRESH_MARGIN_MS
+                        )
+                        OAuthCredentialStore.persist(account, updated)
+                        return Res.Ok(updated)
+                    }
+                    lastMessage = httpFailureText("Claude OAuth", response.code, response.body)
+                    if (response.code in 400..499 && response.code != 429) {
+                        return Res.Err(
+                            "Claude OAuth 令牌已失效（HTTP ${response.code}），请重新登录 Claude Code",
+                            unauthorized = response.code == 400 ||
+                                response.code == 401 ||
+                                response.code == 403
+                        )
+                    }
+                }
+            }
+        }
+        return Res.Err("Claude OAuth 刷新失败：${lastMessage.ifBlank { "请检查网络或代理" }}")
+    }
+
     private fun resolveOrgId(
         engine: HttpEngine,
         account: Account,
@@ -324,6 +425,11 @@ class ClaudeClient : ProviderClient {
         settings: Settings,
         message: String
     ): SendOutcome {
+        // 1) Claude Code OAuth token：优先走官方 CLI 接口 /v1/messages（QQBot 同款）
+        if (OAuthCredentialStore.accessToken(account).isNotBlank()) {
+            return sendViaOAuth(account, settings, message)
+        }
+        // 2) 没有 token 时保留网页 Cookie 发送作为兜底
         val cookie = cookieOf(account)
         if (cookie.isBlank()) {
             val hasToken = tokenOf(account).isNotBlank()
@@ -411,6 +517,71 @@ class ClaudeClient : ProviderClient {
         }
         return SendOutcome(false, attempt.message, attempt.unauthorized)
     }
+
+    /** 用 Claude Code OAuth token 发保活消息（POST /v1/messages）。 */
+    private fun sendViaOAuth(account: Account, settings: Settings, message: String): SendOutcome {
+        val engine = HttpEngine(settings.proxy)
+        val prompt = message.trim().ifEmpty { DefaultMessages.forProvider(ProviderId.CLAUDE) }
+        var current = freshenAccount(engine, account)
+        var attempt = postClaudeMessages(
+            engine,
+            OAuthCredentialStore.accessToken(current),
+            prompt
+        )
+        if (!attempt.ok && attempt.unauthorized) {
+            when (val refreshed = refreshAccountToken(engine, current)) {
+                is Res.Ok -> {
+                    current = refreshed.value
+                    attempt = postClaudeMessages(
+                        engine,
+                        OAuthCredentialStore.accessToken(current),
+                        prompt
+                    )
+                }
+                is Res.Err -> return SendOutcome(
+                    ok = false,
+                    detail = "Claude Code OAuth 令牌已失效且刷新失败：${refreshed.message}",
+                    unauthorized = true
+                )
+            }
+        }
+        return if (attempt.ok) {
+            SendOutcome(ok = true, detail = "Claude 已通过 Claude Code OAuth 收到消息")
+        } else {
+            SendOutcome(ok = false, detail = attempt.message, unauthorized = attempt.unauthorized)
+        }
+    }
+
+    private fun postClaudeMessages(
+        engine: HttpEngine,
+        accessToken: String,
+        prompt: String
+    ): OAuthSendAttempt {
+        val body = buildClaudeMessagesBody(prompt)
+        val headers = claudeCodeMessagesHeaders(accessToken)
+        return when (val result = engine.postJson(CLAUDE_MESSAGES_URL, headers, body)) {
+            is HttpResult.Fail -> OAuthSendAttempt(false, result.message)
+            is HttpResult.Ok -> {
+                val response = result.response
+                val failure = claudeMessagesFailure(response.code, response.body)
+                if (failure == null) {
+                    OAuthSendAttempt(true, "")
+                } else {
+                    OAuthSendAttempt(
+                        ok = false,
+                        message = failure,
+                        unauthorized = response.code == 401 || response.code == 403
+                    )
+                }
+            }
+        }
+    }
+
+    private data class OAuthSendAttempt(
+        val ok: Boolean,
+        val message: String,
+        val unauthorized: Boolean = false
+    )
 
     private fun createConversation(
         engine: HttpEngine,
@@ -770,3 +941,66 @@ internal fun parseClaudeOAuthUsage(raw: String, now: Long): QuotaPatch? {
         plan = plan
     )
 }
+
+
+// ---------------------------------------------------------------------- Claude Code OAuth / CLI 协议
+
+internal const val CLAUDE_MESSAGES_URL = "https://api.anthropic.com/v1/messages"
+internal const val CLAUDE_OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+internal const val CLAUDE_ANTHROPIC_VERSION = "2023-06-01"
+internal const val CLAUDE_CODE_BETA = "claude-code-20250219,oauth-2025-04-20"
+internal const val CLAUDE_CODE_SYSTEM_PROMPT =
+    "You are Claude Code, Anthropic's official CLI for Claude."
+internal const val CLAUDE_CLI_USER_AGENT = "claude-cli/2.1.280"
+
+/** 与 QQBot / pi-ai 一致：提前 5 分钟视为过期。 */
+internal const val CLAUDE_REFRESH_MARGIN_MS = 5L * 60_000L
+
+/** token 端点：platform 域名对部分出口 IP 会 429，因此保留两个备用域名。 */
+internal val CLAUDE_TOKEN_URLS = listOf(
+    "https://platform.claude.com/v1/oauth/token",
+    "https://api.anthropic.com/v1/oauth/token",
+    "https://console.anthropic.com/v1/oauth/token"
+)
+
+/** 构造 `/v1/messages` 保活请求体（QQBot 同款：haiku + 32 tokens + Claude Code system）。 */
+internal fun buildClaudeMessagesBody(prompt: String): String = JSONObject().apply {
+    put("model", "claude-haiku-5-5")
+    put("max_tokens", 32)
+    put(
+        "system",
+        JSONArray().put(
+            JSONObject()
+                .put("type", "text")
+                .put("text", CLAUDE_CODE_SYSTEM_PROMPT)
+        )
+    )
+    put(
+        "messages",
+        JSONArray().put(
+            JSONObject().apply {
+                put("role", "user")
+                put(
+                    "content",
+                    JSONArray().put(
+                        JSONObject()
+                            .put("type", "text")
+                            .put("text", prompt)
+                    )
+                )
+            }
+        )
+    )
+}.toString()
+
+/** Claude Code CLI 身份头（OAuth 走订阅通道必须带）。 */
+internal fun claudeCodeMessagesHeaders(accessToken: String): Map<String, String> = mapOf(
+    "Authorization" to "Bearer $accessToken",
+    "anthropic-version" to CLAUDE_ANTHROPIC_VERSION,
+    "anthropic-beta" to CLAUDE_CODE_BETA,
+    "accept" to "application/json",
+    "anthropic-dangerous-direct-browser-access" to "true",
+    "content-type" to "application/json",
+    "user-agent" to CLAUDE_CLI_USER_AGENT,
+    "x-app" to "cli"
+)

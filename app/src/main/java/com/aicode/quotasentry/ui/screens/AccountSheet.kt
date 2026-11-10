@@ -1,8 +1,13 @@
 package com.aicode.quotasentry.ui.screens
 
+import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import android.content.Intent
+import android.net.Uri
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
@@ -24,11 +29,14 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
@@ -142,7 +150,7 @@ fun AccountSheet(accountId: String?, onDismiss: () -> Unit) {
         open = accountId != null,
         onDismiss = { dismiss() },
         title = "连接账号",
-        subtitle = "同一服务可以连接多个账号；凭据只保存在本机"
+        subtitle = "同一服务可连多个账号；OAuth 授权后即可发消息，Cookie 仅作备用"
     ) {
         if (current == null) return@GlassSheet
         val provider = current.provider
@@ -282,7 +290,7 @@ fun AccountSheet(accountId: String?, onDismiss: () -> Unit) {
             // 只有 Claude / ChatGPT 有可用的 OAuth 额度接口；Gemini 仍用 Cookie。
             if (provider in OAuthFlow.supported) {
                 GlassChip(
-                    text = "Chrome 授权登录",
+                    text = if (provider == ProviderId.CHATGPT) "设备码登录" else "Chrome 授权登录",
                     icon = QsIcon.GLOBE,
                     onClick = {
                         persist(account.id)
@@ -346,9 +354,9 @@ fun AccountSheet(accountId: String?, onDismiss: () -> Unit) {
             Spacer(Modifier.height(6.dp))
             MText(
                 text = if (provider == ProviderId.CLAUDE) {
-                    "仅用于读取官方 5 小时 / 7 天用量；发送保活消息仍需要上面的 claude.ai Cookie。只有令牌没有 Cookie 时不能发送。"
+                    "OAuth 令牌现在可以直接发保活消息，也能读取官方 5 小时 / 7 天用量；上面的 Cookie 只作为备用/历史账号的兜底。"
                 } else {
-                    "Cookie 失效时可以只填 accessToken 查额度 / 发送消息。"
+                    "OAuth 令牌可以直接发保活消息；Cookie 只在没有令牌时作为兜底。"
                 },
                 color = p.faint,
                 style = QsType.tiny
@@ -481,6 +489,29 @@ private fun readClipboard(context: Context): String? = runCatching {
     clip.getItemAt(0).coerceToText(context)?.toString()
 }.getOrNull()
 
+/** 把文字写进剪贴板（设备码验证码等）。 */
+private fun copyToClipboard(context: Context, text: String): Boolean = runCatching {
+    val manager = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+        ?: return false
+    manager.setPrimaryClip(ClipData.newPlainText("额度哨兵", text))
+    true
+}.getOrDefault(false)
+
+/** 用系统 Chrome 打开链接；没装 Chrome 时退回通用浏览器（不使用任何内置 WebView）。 */
+private fun openInChrome(context: Context, url: String) {
+    runCatching {
+        val base = Intent(Intent.ACTION_VIEW, Uri.parse(url))
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        val chrome = Intent(base).setPackage("com.android.chrome")
+        val canChrome = runCatching {
+            context.packageManager.resolveActivity(chrome, 0) != null
+        }.getOrDefault(false)
+        context.startActivity(if (canChrome) chrome else base)
+    }.onFailure {
+        AppToast.show(context, "无法打开浏览器：${it.message ?: "请检查是否安装了 Chrome"}")
+    }
+}
+
 /** Chrome OAuth 授权面板：等待用户操作 / 兑换中 / 出错重试 / 未开始的说明。 */
 @Composable
 private fun OAuthPanel(
@@ -491,8 +522,10 @@ private fun OAuthPanel(
     onCapture: () -> Unit
 ) {
     val p = QsTheme.palette
+    val context = LocalContext.current
     val mine: OAuthState? = when (state) {
         is OAuthState.Waiting -> state.takeIf { it.provider == provider }
+        is OAuthState.DeviceCode -> state.takeIf { it.provider == provider }
         is OAuthState.Exchanging -> state.takeIf { it.provider == provider }
         is OAuthState.Error -> state.takeIf { it.provider == provider }
         else -> null
@@ -503,25 +536,36 @@ private fun OAuthPanel(
         padding = PaddingValues(12.dp),
         glow = when (mine) {
             is OAuthState.Error -> p.danger.copy(alpha = 0.08f)
-            is OAuthState.Waiting -> p.accent.copy(alpha = 0.08f)
+            is OAuthState.Waiting, is OAuthState.DeviceCode -> p.accent.copy(alpha = 0.08f)
             else -> Color.Transparent
         }
     ) {
         when (mine) {
             is OAuthState.Waiting -> {
+                val fetchingDevice = mine.hint.contains("正在获取")
+                val manualCode = provider == ProviderId.CLAUDE && mine.hint.contains("复制")
                 Row(verticalAlignment = Alignment.Top) {
-                    QsIcon(QsIcon.GLOBE, size = 15.dp, tint = p.accent)
+                    if (fetchingDevice) {
+                        LoadingRing(ringSize = 15.dp, color = p.accent)
+                    } else {
+                        QsIcon(QsIcon.GLOBE, size = 15.dp, tint = p.accentInk)
+                    }
                     Spacer(Modifier.width(8.dp))
-                    MText(
-                        text = mine.hint,
-                        color = p.text,
-                        style = QsType.caption,
-                        modifier = Modifier.weight(1f)
-                    )
+                    Column(Modifier.weight(1f)) {
+                        MText(text = mine.hint, color = p.text, style = QsType.caption)
+                        if (provider == ProviderId.CLAUDE && !manualCode) {
+                            Spacer(Modifier.height(4.dp))
+                            MText(
+                                text = "授权完成后会自动回到 App，无需手动复制；长时间没反应可取消后重试。",
+                                color = p.faint,
+                                style = QsType.tiny
+                            )
+                        }
+                    }
                 }
                 Spacer(Modifier.height(10.dp))
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    if (provider == ProviderId.CLAUDE) {
+                    if (manualCode) {
                         GlassChip(
                             text = "已复制授权码？点此读取",
                             icon = QsIcon.PASTE,
@@ -530,6 +574,80 @@ private fun OAuthPanel(
                         )
                     }
                     GlassChip(text = "取消", onClick = onCancel, height = 30.dp)
+                }
+            }
+
+            is OAuthState.DeviceCode -> {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    QsIcon(QsIcon.LOCK, size = 15.dp, tint = p.accentInk)
+                    Spacer(Modifier.width(8.dp))
+                    MText(
+                        text = "在 Chrome 输入下面的验证码完成 " + provider.label + " 登录",
+                        color = p.text,
+                        style = QsType.caption,
+                        modifier = Modifier.weight(1f)
+                    )
+                }
+                Spacer(Modifier.height(10.dp))
+                // 大字验证码，方便对照输入
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(12.dp))
+                        .background(p.text.copy(alpha = 0.06f))
+                        .padding(vertical = 14.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    MText(
+                        text = mine.userCode,
+                        color = p.accentInk,
+                        style = QsType.mono,
+                        fontWeight = FontWeight.Bold,
+                        letterSpacing = 4.sp,
+                        maxLines = 1
+                    )
+                }
+                Spacer(Modifier.height(8.dp))
+                MText(
+                    text = "在 Chrome 打开 " + mine.verificationUrl + " 并输入上面的代码",
+                    color = p.dim,
+                    style = QsType.tiny
+                )
+                if (mine.hint.isNotBlank()) {
+                    Spacer(Modifier.height(4.dp))
+                    MText(text = mine.hint, color = p.faint, style = QsType.tiny)
+                }
+                Spacer(Modifier.height(10.dp))
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    GlassChip(
+                        text = "复制验证码",
+                        icon = QsIcon.PASTE,
+                        onClick = {
+                            if (copyToClipboard(context, mine.userCode)) {
+                                AppToast.show(context, "验证码已复制")
+                            } else {
+                                AppToast.show(context, "复制失败，请手动输入")
+                            }
+                        },
+                        height = 30.dp
+                    )
+                    GlassChip(
+                        text = "打开验证页",
+                        icon = QsIcon.GLOBE,
+                        onClick = { openInChrome(context, mine.verificationUrl) },
+                        height = 30.dp
+                    )
+                    GlassChip(text = "取消", onClick = onCancel, height = 30.dp)
+                }
+                Spacer(Modifier.height(9.dp))
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    LoadingRing(ringSize = 14.dp, color = p.accent)
+                    Spacer(Modifier.width(7.dp))
+                    MText(
+                        text = "等待你在 Chrome 完成登录，完成后会自动连接…",
+                        color = p.dim,
+                        style = QsType.tiny
+                    )
                 }
             }
 
@@ -567,9 +685,9 @@ private fun OAuthPanel(
             else -> {
                 MText(
                     text = if (provider == ProviderId.CLAUDE) {
-                        "用 Chrome 登录 Claude 并授权，App 会自动读取授权码换取 OAuth 令牌（官方额度更准）；发消息仍需要 Cookie。"
+                        "用 Chrome 登录 Claude 并授权，授权完成后会自动回到 App 完成连接；若没有自动完成，按页面提示复制授权码再回来。"
                     } else {
-                        "用 Chrome 登录并授权 ChatGPT，授权完成后会自动回到 App，全程无需手动复制。"
+                        "设备码登录：点「设备码登录」后，App 会显示一段验证码，在 Chrome 验证页输入即可，全程不需要复制 Cookie。"
                     },
                     color = p.dim,
                     style = QsType.tiny
@@ -589,17 +707,17 @@ private fun requiredCookieHint(provider: ProviderId): String = when (provider) {
 
 private fun cookieHelp(provider: ProviderId): List<String> = when (provider) {
     ProviderId.CLAUDE -> listOf(
-        "Chrome 授权登录：在 Chrome 登录 Claude 并授权，复制页面上的授权码，返回 App 会自动粘贴兑换",
-        "OAuth 令牌只用于读取官方 5 小时 / 7 天额度，发送保活消息仍然需要 claude.ai Cookie",
-        "Cookie 方案：claude.ai 登录后，F12 → Network → 任意请求 → 复制 Request Headers 里的 Cookie",
-        "必须包含 sessionKey（sk-ant-sid01-…）；遇到 Cloudflare 风控时把 cf_clearance 一起粘贴"
+        "Chrome 授权登录：登录并授权后会自动回到 App 完成连接；若没有自动完成，按页面提示复制授权码，回来会自动读取",
+        "OAuth 令牌已经可以直接发送保活消息并读取官方 5 小时 / 7 天额度",
+        "Cookie 只作为备用：claude.ai 登录后，F12 → Network → 任意请求 → 复制 Request Headers 里的 Cookie",
+        "Cookie 方案需要 sessionKey（sk-ant-sid01-…）；遇到 Cloudflare 风控时把 cf_clearance 一起粘贴"
     )
 
     ProviderId.CHATGPT -> listOf(
-        "Chrome 授权登录：登录并授权后会自动回到 App，回调地址为 localhost:1455，无需手动复制",
-        "Cookie 方案：chatgpt.com 登录后复制完整 Cookie，必须包含 __Secure-next-auth.session-token",
-        "有 cf_clearance 时一起粘贴，成功率更高",
-        "也可以只粘贴 accessToken（/api/auth/session 里的 accessToken）"
+        "设备码登录：点「Chrome 授权登录」后，会显示一段验证码，在 Chrome 的验证页输入即可，无需复制 Cookie",
+        "授权完成后会回到 App 自动连接；令牌可直接发送保活消息",
+        "Cookie 只作为备用：chatgpt.com 登录后复制完整 Cookie，必须包含 __Secure-next-auth.session-token",
+        "也可以直接粘贴 accessToken（/api/auth/session 里的 accessToken）"
     )
 
     ProviderId.GEMINI -> listOf(
