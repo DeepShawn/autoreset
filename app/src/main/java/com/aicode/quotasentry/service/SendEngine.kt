@@ -114,15 +114,17 @@ object SendEngine {
                 Store.updateQuotaById(account.id) {
                     it.copy(lastSendOk = false, lastSendMessage = message)
                 }
+                val channel = if (account.credentials.accessToken.isNotBlank()) "OAuth" else "网页"
+                val detailText = "【$channel 通道】" + outcome.detail.ifBlank { "未知错误" }
                 Store.record(
                     provider = provider,
                     ok = false,
                     text = "$title 发送失败",
-                    detail = outcome.detail,
+                    detail = detailText,
                     kind = EventKind.SEND,
                     at = now
                 )
-                Result(false, outcome.detail, outcome.unauthorized)
+                Result(false, detailText, outcome.unauthorized)
             }
         }
 
