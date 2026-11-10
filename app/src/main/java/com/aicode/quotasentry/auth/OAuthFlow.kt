@@ -56,8 +56,9 @@ object OAuthFlow {
 
     private const val CLAUDE_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
     private const val CLAUDE_SCOPES =
-        "org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload"
-    private const val CLAUDE_AUTHORIZE = "https://claude.com/cai/oauth/authorize"
+        "org:create_api_key user:profile user:profile user:inference user:sessions:claude_code " +
+            "user:mcp_servers user:file_upload user:plugins"
+    private const val CLAUDE_AUTHORIZE = "https://platform.claude.com/oauth/authorize"
     private const val CLAUDE_REDIRECT = "https://platform.claude.com/oauth/code/callback"
     private val CLAUDE_TOKEN_URLS = listOf(
         "https://platform.claude.com/v1/oauth/token",
@@ -357,7 +358,12 @@ object OAuthFlow {
                 "code_verifier" to pendingVerifier
             )
             if (statePart.isNotBlank()) fields["state"] = statePart
-            when (val result = engine.postForm(url, headers = mapOf("Accept" to "application/json"), fields = fields)) {
+            val bodyJson = org.json.JSONObject(fields as Map<*, *>).toString()
+            val claudeHeaders = mapOf(
+                "Accept" to "application/json",
+                "Content-Type" to "application/json"
+            )
+            when (val result = engine.postJson(url, headers = claudeHeaders, body = bodyJson)) {
                 is HttpResult.Ok -> {
                     val response = result.response
                     if (!response.ok) {
