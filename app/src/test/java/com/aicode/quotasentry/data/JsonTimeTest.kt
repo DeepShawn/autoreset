@@ -13,6 +13,16 @@ import java.time.Instant
 class JsonTimeTest {
 
     @Test
+    fun `used_percent one means one percent not hundred`() {
+        assertEquals(0.01f, normalizeUsedFraction("used_percent", 1.0), 0.0001f)
+        assertEquals(1f, normalizeUsedFraction("used_percent", 100.0), 0.0001f)
+        assertEquals(0.03f, normalizeUsedFraction("used_percent", 3.0), 0.0001f)
+        // utilization 仍按 0..1 / 0..100 兼容
+        assertEquals(0.83f, normalizeUsedFraction("utilization", 83.0), 0.0001f)
+        assertEquals(0.42f, normalizeUsedFraction("utilization", 0.42), 0.0001f)
+    }
+
+    @Test
     fun `ISO8601 Z 时间`() {
         assertEquals(
             Instant.parse("2026-11-09T15:00:00Z").toEpochMilli(),

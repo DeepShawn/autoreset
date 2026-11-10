@@ -197,8 +197,15 @@ internal fun readUsedRaw(obj: JSONObject): Pair<String, Double>? {
  */
 internal fun normalizeUsedFraction(rawKey: String, value: Double): Float {
     if (!value.isFinite()) return 0f
-    @Suppress("UNUSED_PARAMETER")
-    val fraction = if (value > 1.5) value / 100.0 else value
+    // 字段名明确写了 percent/pct 的，一定是百分数：ChatGPT wham/usage 返回 used_percent=1
+    // 表示「已用 1%」，不能按 0..1 的小数当成 100%。
+    val percentNamed = rawKey.contains("percent", ignoreCase = true) ||
+        rawKey.contains("pct", ignoreCase = true)
+    val fraction = when {
+        percentNamed -> value / 100.0
+        value > 1.5 -> value / 100.0
+        else -> value
+    }
     return fraction.coerceIn(0.0, 1.0).toFloat()
 }
 
