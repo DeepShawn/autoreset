@@ -101,6 +101,7 @@ object SendEngine {
                         settings.limitFor(provider)
                     ).copy(lastSendOk = true, lastSendMessage = message)
                 }
+                Store.updateAccountById(account.id) { it.copy(lastError = "") }
                 Store.record(
                     provider = provider,
                     ok = true,
@@ -154,6 +155,8 @@ object SendEngine {
                     Store.updateQuotaById(account.id) { quota ->
                         QuotaMath.applyPatch(quota, fetch.patch, now)
                     }
+                    // 刷新成功说明账号可用，清掉之前连接/发送失败留下的旧错误文案
+                    Store.updateAccountById(account.id) { it.copy(lastError = "") }
                     if (record) {
                         Store.record(
                             provider = provider,

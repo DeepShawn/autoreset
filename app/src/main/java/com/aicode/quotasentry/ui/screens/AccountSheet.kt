@@ -352,11 +352,26 @@ fun AccountSheet(accountId: String?, onDismiss: () -> Unit) {
                 keyboardType = KeyboardType.Text
             )
             Spacer(Modifier.height(6.dp))
+            val hasToken = accessToken.isNotBlank()
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                StatusDot(if (hasToken) p.ok else p.warn, size = 6.dp)
+                Spacer(Modifier.width(6.dp))
+                MText(
+                    text = if (hasToken) {
+                        "已保存 OAuth 令牌：发送和额度都走官方接口"
+                    } else {
+                        "未保存 OAuth 令牌：现在只能用网页 Cookie，容易被 Cloudflare 403"
+                    },
+                    color = if (hasToken) p.ok else p.warn,
+                    style = QsType.tiny
+                )
+            }
+            Spacer(Modifier.height(4.dp))
             MText(
                 text = if (provider == ProviderId.CLAUDE) {
-                    "OAuth 令牌现在可以直接发保活消息，也能读取官方 5 小时 / 7 天用量；上面的 Cookie 只作为备用/历史账号的兜底。"
+                    "上面的 Cookie 只作为备用/历史账号的兜底；重新授权一次会写入新令牌。"
                 } else {
-                    "OAuth 令牌可以直接发保活消息；Cookie 只在没有令牌时作为兜底。"
+                    "Cookie 只在没有令牌时作为兜底；设备码登录会自动写入令牌。"
                 },
                 color = p.faint,
                 style = QsType.tiny
