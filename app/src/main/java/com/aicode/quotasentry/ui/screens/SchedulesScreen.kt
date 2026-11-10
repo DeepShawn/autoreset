@@ -120,7 +120,7 @@ fun SchedulesScreen(now: Long) {
                                         provider = provider,
                                         mode = ScheduleMode.FOLLOW_RESET
                                     )
-                                    val next = computeNextRun(base, quotas[provider], windowMillis, now)
+                                    val next = computeNextRun(base, firstAccountQuota(provider, accounts, quotas), windowMillis, now)
                                     Store.upsertRule(base.copy(nextRunAt = next))
                                     created += 1
                                 }
@@ -139,18 +139,20 @@ fun SchedulesScreen(now: Long) {
                 val index = sorted.indexOf(rule)
                 StaggerItem(1 + index) {
                     Spacer(Modifier.height(12.dp))
-                    val quota = quotas[rule.provider]
+                    val providerAccounts = accounts.filter { it.provider == rule.provider }
+                    val linkedCount = providerAccounts.count { it.linked }
+                    val quota = firstAccountQuota(rule.provider, accounts, quotas)
                     val next = computeNextRun(rule, quota, windowMillis, now)
-                    val account = accounts[rule.provider]
                     RuleCard(
                         rule = rule,
                         nextAt = next,
                         now = now,
-                        linked = account?.linked == true,
+                        accountCount = providerAccounts.size,
+                        linkedCount = linkedCount,
                         onToggle = { checked ->
                             Store.updateRule(rule.id) { current ->
                                 val updated = current.copy(enabled = checked)
-                                val target = if (checked) computeNextRun(updated, quotas[current.provider], windowMillis, now) else 0L
+                                val target = if (checked) computeNextRun(updated, firstAccountQuota(current.provider, accounts, quotas), windowMillis, now) else 0L
                                 updated.copy(
                                     nextRunAt = if (checked) target.coerceAtLeast(now + 30_000L) else 0L
                                 )
@@ -246,10 +248,12 @@ private fun RuleCard(
     rule: ScheduleRule,
     nextAt: Long,
     now: Long,
-    linked: Boolean,
+    accountCount: Int,
+    linkedCount: Int,
     onToggle: (Boolean) -> Unit,
     onEdit: () -> Unit
 ) {
+    val linked = linkedCount > 0
     val p = QsTheme.palette
     GlassCard(onClick = onEdit, glow = if (rule.enabled) p.accent.copy(alpha = 0.06f) else p.text.copy(alpha = 0.02f)) {
         Row(verticalAlignment = Alignment.CenterVertically) {
@@ -266,7 +270,8 @@ private fun RuleCard(
                     StatusDot(
                         color = when {
                             !rule.enabled -> p.faint
-                            !linked -> p.warn
+                            linkedCount == 0 -> p.warn
+                            linkedCount < accountCount -> p.warn
                             else -> p.ok
                         },
                         size = 7.dp,
@@ -276,12 +281,13 @@ private fun RuleCard(
                     MText(
                         text = when {
                             !rule.enabled -> "已暂停"
-                            !linked -> "账号未连接，计划不会发送"
+                            linkedCount == 0 -> "该服务没有已连接账号"
+                            linkedCount < accountCount -> "部分账号未连接（$linkedCount/$accountCount）"
                             else -> ScheduleMath.describeNext(rule, nextAt, now)
                         },
                         color = when {
                             !rule.enabled -> p.dim
-                            !linked -> p.warn
+                            linkedCount < accountCount -> p.warn
                             else -> p.dim
                         },
                         style = QsType.caption,
@@ -296,6 +302,12 @@ private fun RuleCard(
         Spacer(Modifier.height(12.dp))
         Box(Modifier.fillMaxWidth().height(0.5.dp).background(p.divider))
         Spacer(Modifier.height(10.dp))
+        RowLabel(
+            label = "发送对象",
+            value = "将发送给 $accountCount 个账号 · 已连接 $linkedCount",
+            valueColor = if (linkedCount < accountCount) p.warn else p.text
+        )
+        Spacer(Modifier.height(7.dp))
         RowLabel(
             label = "保活消息",
             value = rule.message.ifBlank { "默认 ${com.aicode.quotasentry.core.DefaultMessages.forProvider(rule.provider)}" }
@@ -350,6 +362,7 @@ private fun ScheduleEditorSheet(
 ) {
     val p = QsTheme.palette
     val context = LocalContext.current
+    val accounts by Store.accounts.collectAsState()
     val quotas by Store.quotas.collectAsState()
     val settings by Store.settings.collectAsState()
     val windowMillis = settings.windowMillis()
@@ -375,7 +388,7 @@ private fun ScheduleEditorSheet(
             enabled = initial?.enabled ?: true
         )
     }
-    val nextPreview = computeNextRun(draft, quotas[provider], windowMillis, now)
+    val nextPreview = computeNextRun(draft, firstAccountQuota(provider, accounts, quotas), windowMillis, now)
 
     GlassSheet(
         open = open,
@@ -535,7 +548,8 @@ private fun ScheduleEditorSheet(
             onClick = {
                 val saved = draft.copy(
                     nextRunAt = if (draft.enabled) {
-                        computeNextRun(draft, quotas[provider], windowMillis, now).coerceAtLeast(now + 30_000L)
+                        computeNextRun(draft, firstAccountQuota(provider, accounts, quotas), windowMillis, now)
+                            .coerceAtLeast(now + 30_000L)
                     } else {
                         0L
                     }

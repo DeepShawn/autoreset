@@ -12,6 +12,9 @@ import java.util.UUID
 /**
  * 全应用共享的唯一数据仓库：UI 与前台服务同进程，直接读写同一份 StateFlow，
  * 落盘用 SharedPreferences + org.json（不引入 Room / 序列化库，减小体积）。
+ *
+ * 多账号：`accounts` 是列表，每个账号有稳定 id；额度 `quotas` 按账号 id 存。
+ * 计划仍然是「每个 Provider 一条」，计划到点时会对该 Provider 下所有账号生效。
  */
 object Store {
 
@@ -31,16 +34,16 @@ object Store {
     @Volatile
     private var initialized = false
 
-    private val _accounts = MutableStateFlow<Map<ProviderId, Account>>(emptyMap())
-    private val _quotas = MutableStateFlow<Map<ProviderId, QuotaState>>(emptyMap())
+    private val _accounts = MutableStateFlow<List<Account>>(emptyList())
+    private val _quotas = MutableStateFlow<Map<String, QuotaState>>(emptyMap())
     private val _rules = MutableStateFlow<List<ScheduleRule>>(emptyList())
     private val _settings = MutableStateFlow(Settings())
     private val _events = MutableStateFlow<List<SendEvent>>(emptyList())
     private val _serviceRunning = MutableStateFlow(false)
     private val _initializedFlow = MutableStateFlow(false)
 
-    val accounts: StateFlow<Map<ProviderId, Account>> = _accounts.asStateFlow()
-    val quotas: StateFlow<Map<ProviderId, QuotaState>> = _quotas.asStateFlow()
+    val accounts: StateFlow<List<Account>> = _accounts.asStateFlow()
+    val quotas: StateFlow<Map<String, QuotaState>> = _quotas.asStateFlow()
     val rules: StateFlow<List<ScheduleRule>> = _rules.asStateFlow()
     val settings: StateFlow<Settings> = _settings.asStateFlow()
     val events: StateFlow<List<SendEvent>> = _events.asStateFlow()
@@ -59,13 +62,117 @@ object Store {
         }
     }
 
+    // ------------------------------------------------------------------ 账号
+
+    /** 按 Provider 分组顺序返回所有账号。 */
+    fun allAccounts(): List<Account> =
+        _accounts.value.sortedWith(
+            compareBy({ ProviderId.ordered.indexOf(it.provider) }, { it.linkedAt })
+        )
+
+    fun linkedAccounts(): List<Account> = allAccounts().filter { it.linked }
+
+    fun accountsFor(provider: ProviderId): List<Account> =
+        allAccounts().filter { it.provider == provider }
+
+    fun accountById(id: String): Account? = _accounts.value.firstOrNull { it.id == id }
+
+    /** 兼容旧代码：取该 Provider 的第一个账号；没有时返回临时的空账号。 */
     fun account(provider: ProviderId): Account =
-        _accounts.value[provider] ?: Account.empty(provider)
+        accountsFor(provider).firstOrNull() ?: Account.empty(provider)
 
-    fun quota(provider: ProviderId): QuotaState =
-        _quotas.value[provider] ?: defaultQuota(provider, _settings.value)
+    /** 新增一个空账号槽位并返回（同一 Provider 可多次调用）。 */
+    fun addAccount(provider: ProviderId): Account = synchronized(lock) {
+        val account = Account(provider = provider)
+        _accounts.value = _accounts.value + account
+        _quotas.value = _quotas.value + (account.id to defaultQuota(provider, _settings.value))
+        persistAccountsLocked()
+        persistQuotasLocked()
+        account
+    }
 
-    fun quotaFor(provider: ProviderId): QuotaState = quota(provider)
+    fun removeAccount(id: String) = synchronized(lock) {
+        _accounts.value = _accounts.value.filterNot { it.id == id }
+        _quotas.value = _quotas.value - id
+        persistAccountsLocked()
+        persistQuotasLocked()
+    }
+
+    fun updateAccountById(id: String, transform: (Account) -> Account): Account? = synchronized(lock) {
+        val current = accountById(id) ?: return null
+        val next = transform(current).copy(id = id, provider = current.provider)
+        _accounts.value = _accounts.value.map { if (it.id == id) next else it }
+        persistAccountsLocked()
+        next
+    }
+
+    /** 兼容旧代码：更新该 Provider 的第一个账号。 */
+    fun updateAccount(provider: ProviderId, transform: (Account) -> Account): Account =
+        updateAccountById(account(provider).id, transform) ?: account(provider)
+
+    fun setAccount(account: Account) {
+        synchronized(lock) {
+            val exists = _accounts.value.any { it.id == account.id }
+            _accounts.value = if (exists) {
+                _accounts.value.map { if (it.id == account.id) account else it }
+            } else {
+                _accounts.value + account
+            }
+            if (!_quotas.value.containsKey(account.id)) {
+                _quotas.value = _quotas.value + (account.id to defaultQuota(account.provider, _settings.value))
+            }
+            persistAccountsLocked()
+            persistQuotasLocked()
+        }
+    }
+
+    // ------------------------------------------------------------------ 额度
+
+    fun quotaFor(account: Account): QuotaState =
+        _quotas.value[account.id] ?: defaultQuota(account.provider, _settings.value)
+
+    fun quota(provider: ProviderId): QuotaState = quotaFor(account(provider))
+
+    fun quotaById(accountId: String): QuotaState {
+        val account = accountById(accountId) ?: return defaultQuota(ProviderId.CLAUDE, _settings.value)
+        return quotaFor(account)
+    }
+
+    fun viewFor(account: Account, now: Long = System.currentTimeMillis()): QuotaView =
+        QuotaMath.view(quotaFor(account), _settings.value, now)
+
+    /** 兼容旧代码：该 Provider 第一个账号的视图。 */
+    fun viewFor(provider: ProviderId, now: Long = System.currentTimeMillis()): QuotaView =
+        viewFor(account(provider), now)
+
+    fun updateQuotaById(accountId: String, transform: (QuotaState) -> QuotaState): QuotaState =
+        synchronized(lock) {
+            val account = accountById(accountId)
+            val provider = account?.provider ?: ProviderId.CLAUDE
+            val current = _quotas.value[accountId] ?: defaultQuota(provider, _settings.value)
+            val next = transform(current).copy(provider = provider)
+            _quotas.value = _quotas.value + (accountId to next)
+            persistQuotasLocked()
+            next
+        }
+
+    /** 兼容旧代码：更新该 Provider 第一个账号的额度。 */
+    fun updateQuota(provider: ProviderId, transform: (QuotaState) -> QuotaState): QuotaState =
+        updateQuotaById(account(provider).id, transform)
+
+    /** 兼容旧代码：写到该 Provider 第一个账号。 */
+    fun setQuota(state: QuotaState) {
+        setQuotaFor(account(state.provider).id, state)
+    }
+
+    fun setQuotaFor(accountId: String, state: QuotaState) {
+        synchronized(lock) {
+            _quotas.value = _quotas.value + (accountId to state)
+            persistQuotasLocked()
+        }
+    }
+
+    // ------------------------------------------------------------------ 计划
 
     fun settingsNow(): Settings = _settings.value
 
@@ -73,38 +180,6 @@ object Store {
 
     fun activeRuleFor(provider: ProviderId): ScheduleRule? =
         _rules.value.firstOrNull { it.provider == provider && it.enabled }
-
-    fun viewFor(provider: ProviderId, now: Long = System.currentTimeMillis()): QuotaView =
-        QuotaMath.view(quota(provider), _settings.value, now)
-
-    fun updateAccount(provider: ProviderId, transform: (Account) -> Account): Account =
-        synchronized(lock) {
-            val current = account(provider)
-            val next = transform(current).copy(provider = provider)
-            _accounts.value = _accounts.value + (provider to next)
-            persistAccountsLocked()
-            next
-        }
-
-    fun setAccount(account: Account) {
-        updateAccount(account.provider) { account }
-    }
-
-    fun updateQuota(provider: ProviderId, transform: (QuotaState) -> QuotaState): QuotaState =
-        synchronized(lock) {
-            val current = quota(provider)
-            val next = transform(current).copy(provider = provider)
-            _quotas.value = _quotas.value + (provider to next)
-            persistQuotasLocked()
-            next
-        }
-
-    fun setQuota(state: QuotaState) {
-        synchronized(lock) {
-            _quotas.value = _quotas.value + (state.provider to state)
-            persistQuotasLocked()
-        }
-    }
 
     fun upsertRule(rule: ScheduleRule) {
         synchronized(lock) {
@@ -147,14 +222,15 @@ object Store {
         synchronized(lock) {
             val next = transform(_settings.value)
             _settings.value = next
-            // 同步各账号的本地条数上限
-            _quotas.value = _quotas.value.mapValues { (provider, quota) ->
-                quota.copy(localLimit = next.limitFor(provider))
+            _quotas.value = _quotas.value.mapValues { (_, quota) ->
+                quota.copy(localLimit = next.limitFor(quota.provider))
             }
             persistSettingsLocked()
             persistQuotasLocked()
             next
         }
+
+    // ------------------------------------------------------------------ 事件
 
     fun addEvent(event: SendEvent) {
         val next = (_events.value + event).takeLast(200)
@@ -205,26 +281,29 @@ object Store {
             ?: Settings()
         _settings.value = settings
 
-        val accounts = mutableMapOf<ProviderId, Account>()
-        runCatching { p.getString(KEY_ACCOUNTS, null)?.let(::decodeAccounts) }.getOrNull()
-            ?.forEach { (k, v) -> accounts[k] = v }
-        ProviderId.ordered.forEach { provider ->
-            val existing = accounts[provider]
-            accounts[provider] = if (existing == null) Account.empty(provider) else existing
-        }
-        _accounts.value = accounts
+        val loadedAccounts = runCatching {
+            p.getString(KEY_ACCOUNTS, null)?.let(::decodeAccounts)
+        }.getOrNull().orEmpty().toMutableList()
 
-        val quotas = mutableMapOf<ProviderId, QuotaState>()
-        runCatching { p.getString(KEY_QUOTAS, null)?.let(::decodeQuotas) }.getOrNull()
-            ?.forEach { (k, v) -> quotas[k] = v }
+        // 保证每个 Provider 至少有一个账号槽位（老版本升级/首次启动）
         ProviderId.ordered.forEach { provider ->
-            val existing = quotas[provider]
-            quotas[provider] = (existing ?: defaultQuota(provider, settings)).copy(
-                provider = provider,
-                localLimit = settings.limitFor(provider)
+            if (loadedAccounts.none { it.provider == provider }) {
+                loadedAccounts.add(Account(provider = provider))
+            }
+        }
+        _accounts.value = loadedAccounts
+
+        val loadedQuotas = runCatching {
+            p.getString(KEY_QUOTAS, null)?.let(::decodeQuotas)
+        }.getOrNull().orEmpty().toMutableMap()
+        loadedAccounts.forEach { account ->
+            val current = loadedQuotas[account.id] ?: defaultQuota(account.provider, settings)
+            loadedQuotas[account.id] = current.copy(
+                provider = account.provider,
+                localLimit = settings.limitFor(account.provider)
             )
         }
-        _quotas.value = quotas
+        _quotas.value = loadedQuotas
 
         _rules.value = runCatching { p.getString(KEY_RULES, null)?.let(::decodeRules) }.getOrNull()
             ?: emptyList()
@@ -255,10 +334,12 @@ object Store {
 
     // ---------------------------------------------------------------- 编码
 
-    private fun encodeAccounts(map: Map<ProviderId, Account>): String {
-        val root = JSONObject()
-        map.forEach { (provider, account) ->
-            root.put(provider.key, JSONObject().apply {
+    private fun encodeAccounts(accounts: List<Account>): String {
+        val array = JSONArray()
+        accounts.forEach { account ->
+            array.put(JSONObject().apply {
+                put("id", account.id)
+                put("provider", account.provider.key)
                 put("linked", account.linked)
                 put("plan", account.plan)
                 put("label", account.label)
@@ -270,41 +351,59 @@ object Store {
                 put("extra", JSONObject(account.credentials.extra))
             })
         }
-        return root.toString()
+        return array.toString()
     }
 
-    private fun decodeAccounts(raw: String): Map<ProviderId, Account> {
-        val root = JSONObject(raw)
-        val result = mutableMapOf<ProviderId, Account>()
-        root.keys().forEach { key ->
-            val provider = ProviderId.fromKey(key) ?: return@forEach
-            val obj = root.optJSONObject(key) ?: return@forEach
-            val extra = mutableMapOf<String, String>()
-            obj.optJSONObject("extra")?.let { e ->
-                e.keys().forEach { k -> extra[k] = e.optString(k) }
+    /** 兼容旧版本：旧格式是 { "claude": {...}, "chatgpt": {...} }，新格式是数组。 */
+    private fun decodeAccounts(raw: String): List<Account> {
+        val result = mutableListOf<Account>()
+        val trimmed = raw.trim()
+        if (trimmed.startsWith("[")) {
+            val array = JSONArray(trimmed)
+            for (i in 0 until array.length()) {
+                val obj = array.optJSONObject(i) ?: continue
+                decodeAccountObject(obj)?.let { result.add(it) }
             }
-            result[provider] = Account(
-                provider = provider,
-                credentials = Credentials(
-                    cookie = obj.optString("cookie"),
-                    accessToken = obj.optString("accessToken"),
-                    extra = extra
-                ),
-                linked = obj.optBoolean("linked"),
-                plan = obj.optString("plan"),
-                label = obj.optString("label"),
-                linkedAt = obj.optLong("linkedAt"),
-                lastVerifiedAt = obj.optLong("lastVerifiedAt"),
-                lastError = obj.optString("lastError")
-            )
+        } else {
+            val root = JSONObject(trimmed)
+            root.keys().forEach { key ->
+                val provider = ProviderId.fromKey(key) ?: return@forEach
+                val obj = root.optJSONObject(key) ?: return@forEach
+                decodeAccountObject(obj, fallbackProvider = provider)?.let { result.add(it) }
+            }
         }
         return result
     }
 
-    private fun encodeQuotas(map: Map<ProviderId, QuotaState>): String {
+    private fun decodeAccountObject(obj: JSONObject, fallbackProvider: ProviderId? = null): Account? {
+        val provider = ProviderId.fromKey(obj.optString("provider")) ?: fallbackProvider ?: return null
+        val extra = mutableMapOf<String, String>()
+        obj.optJSONObject("extra")?.let { e ->
+            e.keys().forEach { k -> extra[k] = e.optString(k) }
+        }
+        val id = obj.optString("id").takeIf { it.isNotBlank() } ?: UUID.randomUUID().toString()
+        return Account(
+            id = id,
+            provider = provider,
+            credentials = Credentials(
+                cookie = obj.optString("cookie"),
+                accessToken = obj.optString("accessToken"),
+                extra = extra
+            ),
+            linked = obj.optBoolean("linked"),
+            plan = obj.optString("plan"),
+            label = obj.optString("label"),
+            linkedAt = obj.optLong("linkedAt"),
+            lastVerifiedAt = obj.optLong("lastVerifiedAt"),
+            lastError = obj.optString("lastError")
+        )
+    }
+
+    private fun encodeQuotas(quotas: Map<String, QuotaState>): String {
         val root = JSONObject()
-        map.forEach { (provider, quota) ->
-            root.put(provider.key, JSONObject().apply {
+        quotas.forEach { (id, quota) ->
+            root.put(id, JSONObject().apply {
+                put("provider", quota.provider.key)
                 put("officialUsedFraction", quota.officialUsedFraction?.toDouble() ?: JSONObject.NULL)
                 put("officialWindowMillis", quota.officialWindowMillis ?: JSONObject.NULL)
                 put("officialResetAt", quota.officialResetAt ?: JSONObject.NULL)
@@ -322,13 +421,22 @@ object Store {
         return root.toString()
     }
 
-    private fun decodeQuotas(raw: String): Map<ProviderId, QuotaState> {
+    /** 兼容旧版：旧的 key 是 provider；新 key 是 accountId。 */
+    private fun decodeQuotas(raw: String): Map<String, QuotaState> {
         val root = JSONObject(raw)
-        val result = mutableMapOf<ProviderId, QuotaState>()
+        val result = mutableMapOf<String, QuotaState>()
         root.keys().forEach { key ->
-            val provider = ProviderId.fromKey(key) ?: return@forEach
             val obj = root.optJSONObject(key) ?: return@forEach
-            result[provider] = QuotaState(
+            val provider = ProviderId.fromKey(obj.optString("provider"))
+                ?: ProviderId.fromKey(key)
+                ?: return@forEach
+            val targetKey = if (ProviderId.fromKey(key) != null) {
+                // 旧数据 key 是 provider，映射到当前第一个账号
+                _accounts.value.firstOrNull { it.provider == provider }?.id ?: return@forEach
+            } else {
+                key
+            }
+            result[targetKey] = QuotaState(
                 provider = provider,
                 officialUsedFraction = if (obj.isNull("officialUsedFraction")) null else obj.optDouble("officialUsedFraction").toFloat(),
                 officialWindowMillis = if (obj.isNull("officialWindowMillis")) null else obj.optLong("officialWindowMillis"),

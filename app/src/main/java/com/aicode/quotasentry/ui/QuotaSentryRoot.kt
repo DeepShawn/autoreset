@@ -98,8 +98,8 @@ private fun RootContent() {
     val pager = rememberPagerState(pageCount = { 3 })
     val scope = rememberCoroutineScope()
     val now = rememberNow()
-    var selectedAccount by remember { mutableStateOf<ProviderId?>(null) }
-    var selectedProvider by remember { mutableStateOf<ProviderId?>(null) }
+    var selectedAccountId by remember { mutableStateOf<String?>(null) }
+    var selectedDetailAccountId by remember { mutableStateOf<String?>(null) }
     var eventsOpen by remember { mutableStateOf(false) }
 
     // 冷启动自动检查更新（UpdateCenter 内部限制 6 小时一次，弱网/无网失败静默）。
@@ -135,15 +135,15 @@ private fun RootContent() {
                 when (page) {
                     0 -> DashboardScreen(
                         now = now,
-                        onOpenAccount = { selectedAccount = it },
+                        onOpenAccount = { selectedAccountId = it },
                         onOpenEvents = { eventsOpen = true },
-                        onOpenProvider = { selectedProvider = it }
+                        onOpenProvider = { selectedDetailAccountId = it }
                     )
 
                     1 -> SchedulesScreen(now = now)
                     else -> SettingsScreen(
                         now = now,
-                        onOpenAccount = { selectedAccount = it }
+                        onOpenAccount = { selectedAccountId = it }
                     )
                 }
             }
@@ -173,13 +173,13 @@ private fun RootContent() {
     }
 
     AccountSheet(
-        provider = selectedAccount,
-        onDismiss = { selectedAccount = null }
+        accountId = selectedAccountId,
+        onDismiss = { selectedAccountId = null }
     )
     ProviderDetailSheet(
-        provider = selectedProvider,
-        onDismiss = { selectedProvider = null },
-        onOpenAccount = { selectedAccount = it },
+        accountId = selectedDetailAccountId,
+        onDismiss = { selectedDetailAccountId = null },
+        onOpenAccount = { selectedAccountId = it },
         onOpenEvents = { eventsOpen = true }
     )
     EventsSheet(

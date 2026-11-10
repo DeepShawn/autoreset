@@ -10,15 +10,16 @@ import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
 import com.aicode.quotasentry.MainActivity
 import com.aicode.quotasentry.R
+import com.aicode.quotasentry.core.Account
 import com.aicode.quotasentry.core.Formatters
-import com.aicode.quotasentry.core.ProviderId
 import com.aicode.quotasentry.core.Settings
+import com.aicode.quotasentry.core.Store
 
 /**
- * 通知集中管理：
+ * 通知集中管理（多账号版）：
  *
- * - `service` 渠道（低优先级、常驻）：显示已连接家数与下一次发送时间，前台服务必须挂它；
- * - `alert` 渠道（默认重要性）：发送结果、连续失败、额度刷新失败。
+ * - `service` 渠道（低优先级、常驻）：显示已连接账号数与下一次发送时间，前台服务必须挂它；
+ * - `alert` 渠道（默认重要性）：发送结果、连续失败、额度刷新失败，通知文案带账号名。
  *
  * 通知点击统一打开 MainActivity；按钮统一走 [ActionReceiver]，不直接在这里执行业务。
  */
@@ -36,6 +37,7 @@ object NotificationHelper {
     private const val REQ_REFRESH = 1103
     private const val REQ_PAUSE = 1104
 
+    /** 提醒通知 id 基数；实际 id 按账号 id 取槽位（见 [ServiceLabels.notificationId]）。 */
     private const val ALERT_ID_BASE = 2100
     private const val RESULT_ID_BASE = 2300
 
@@ -72,21 +74,21 @@ object NotificationHelper {
     /**
      * 构建前台服务常驻通知。
      *
-     * @param connectedCount 已连接的账号家数
+     * @param accountCount 已连接的账号数量（同一 Provider 可能有多个）
      * @param nextSendAt 下一次计划发送时刻（0 = 暂无计划）
      * @param pausedUntil 暂停到何时（0 = 未暂停）
      * @param detailed false 表示用户关掉了「常驻通知」详情，只保留系统要求的最小文案
      */
     fun buildServiceNotification(
         context: Context,
-        connectedCount: Int,
+        accountCount: Int,
         nextSendAt: Long,
         pausedUntil: Long,
         now: Long,
         detailed: Boolean = true
     ): Notification {
         val text = if (detailed) {
-            serviceText(connectedCount, nextSendAt, pausedUntil, now)
+            serviceText(accountCount, nextSendAt, pausedUntil, now)
         } else {
             "后台守护中"
         }
@@ -113,25 +115,26 @@ object NotificationHelper {
     }
 
     /** 常驻通知的正文文案。 */
-    fun serviceText(connectedCount: Int, nextSendAt: Long, pausedUntil: Long, now: Long): String {
+    fun serviceText(accountCount: Int, nextSendAt: Long, pausedUntil: Long, now: Long): String {
         if (pausedUntil > now) {
             return "已暂停，${Formatters.clock(pausedUntil)} 自动恢复"
         }
-        if (connectedCount <= 0) {
+        if (accountCount <= 0) {
             return "还没有连接的账号 · 打开应用连接"
         }
         return if (nextSendAt > now) {
-            "已连接 $connectedCount 家 · 下次 ${Formatters.clock(nextSendAt)}"
+            "已连接 $accountCount 个账号 · 下次 ${Formatters.clock(nextSendAt)}"
         } else {
-            "已连接 $connectedCount 家 · 暂无启用的计划"
+            "已连接 $accountCount 个账号 · 暂无启用的计划"
         }
     }
 
     // ------------------------------------------------------------ 提醒通知
 
-    /** 一次发送的结果通知（成功 / 失败）。同一 Provider 复用同一个 id，不会堆积。 */
-    fun notifySendResult(context: Context, provider: ProviderId, ok: Boolean, detail: String) {
-        val title = if (ok) "${provider.label} 已续命" else "${provider.label} 发送失败"
+    /** 一次发送的结果通知（成功 / 失败）。同一账号复用同一个 id，不同账号互不覆盖。 */
+    fun notifySendResult(context: Context, account: Account, ok: Boolean, detail: String) {
+        val title = AccountSupport.title(account)
+        val heading = if (ok) "$title 已续命" else "$title 发送失败"
         val text = when {
             ok && detail.isNotBlank() -> detail
             ok -> "保活消息已发送，额度窗口已续上"
@@ -139,30 +142,43 @@ object NotificationHelper {
             else -> "请检查网络或登录状态"
         }
         // 成功不打扰（静默），失败才带提示音
-        alert(context, RESULT_ID_BASE + provider.ordinal, title, text, actions = !ok, silent = ok)
+        alert(
+            context,
+            ServiceLabels.notificationId(RESULT_ID_BASE, account),
+            heading,
+            text,
+            actions = !ok,
+            silent = ok
+        )
     }
 
-    /** 连续失败提醒（每 3 次一条，不轰炸）。 */
-    fun notifyFailureAlert(context: Context, provider: ProviderId, consecutiveFailures: Int, detail: String) {
+    /** 连续失败提醒（每 3 次一条，不轰炸），按账号区分。 */
+    fun notifyFailureAlert(
+        context: Context,
+        account: Account,
+        consecutiveFailures: Int,
+        detail: String
+    ) {
+        val title = AccountSupport.title(account)
         val text = buildString {
             append(detail.ifBlank { "请检查网络或登录状态" })
             append(" · 连续 $consecutiveFailures 次，建议打开应用检查账号")
         }
         alert(
             context,
-            ALERT_ID_BASE + provider.ordinal,
-            "${provider.label} 连续 $consecutiveFailures 次发送失败",
+            ServiceLabels.notificationId(ALERT_ID_BASE, account),
+            "$title 连续 $consecutiveFailures 次发送失败",
             text,
             actions = true
         )
     }
 
-    /** 额度刷新失败提醒（手动刷新时给可见反馈）。 */
-    fun notifyRefreshFailure(context: Context, provider: ProviderId, detail: String) {
+    /** 额度刷新失败提醒（手动刷新时给可见反馈），按账号区分。 */
+    fun notifyRefreshFailure(context: Context, account: Account, detail: String) {
         alert(
             context,
-            ALERT_ID_BASE + provider.ordinal,
-            "${provider.label} 额度刷新失败",
+            ServiceLabels.notificationId(ALERT_ID_BASE, account),
+            "${AccountSupport.title(account)} 额度刷新失败",
             detail.ifBlank { "请检查网络或代理设置" },
             actions = true
         )
@@ -213,10 +229,11 @@ object NotificationHelper {
         runCatching { NotificationManagerCompat.from(context.applicationContext).cancel(id) }
     }
 
+    /** 清掉所有账号的提醒通知（停止服务 / 用户断开账号时用）。 */
     fun cancelAllAlerts(context: Context) {
-        ProviderId.ordered.forEach { provider ->
-            cancel(context, ALERT_ID_BASE + provider.ordinal)
-            cancel(context, RESULT_ID_BASE + provider.ordinal)
+        Store.allAccounts().forEach { account ->
+            cancel(context, ServiceLabels.notificationId(ALERT_ID_BASE, account))
+            cancel(context, ServiceLabels.notificationId(RESULT_ID_BASE, account))
         }
     }
 

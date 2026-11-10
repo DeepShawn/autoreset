@@ -16,7 +16,7 @@ class QuotaSentryApp : Application() {
         // 用户上次开过「后台常驻」，且至少连接过一个账号时，冷启动顺手把服务拉起来。
         // 这里只做 best-effort：Android 12+ 在后台启动前台服务可能被拒，失败不影响使用。
         val settings = Store.settingsNow()
-        val linked = Store.accounts.value.values.any { it.linked }
+        val linked = Store.linkedAccounts().isNotEmpty()
         if (settings.backgroundEnabled && linked) {
             runCatching { ServiceController.start(this) }
         }

@@ -2,8 +2,8 @@ package com.aicode.quotasentry.service
 
 import android.content.Context
 import android.os.PowerManager
+import com.aicode.quotasentry.core.Account
 import com.aicode.quotasentry.core.EventKind
-import com.aicode.quotasentry.core.ProviderId
 import com.aicode.quotasentry.core.QuotaFetch
 import com.aicode.quotasentry.core.QuotaMath
 import com.aicode.quotasentry.core.SendOutcome
@@ -52,12 +52,12 @@ internal object WakeLocks {
 }
 
 /**
- * 发送 / 额度刷新的执行引擎，服务与 UI 触发的一次性兜底共用。
+ * 发送 / 额度刷新的执行引擎（多账号版）：服务与 UI 触发的一次性兜底共用。
  *
  * 职责：
- * - 调 ProviderClient（失败一律转成中文原因，不抛给调用方）；
- * - 发送成功后 `QuotaMath.registerSend` + `Store.record`；
- * - 刷新成功后 `QuotaMath.applyPatch`；
+ * - 按账号调用 ProviderClient（失败一律转成中文原因，不抛给调用方）；
+ * - 发送成功后按账号 `QuotaMath.registerSend` + `Store.record`（事件文案带账号名）；
+ * - 刷新成功后按账号 `QuotaMath.applyPatch`；
  * - 网络期间才拿 WakeLock。
  */
 object SendEngine {
@@ -68,20 +68,24 @@ object SendEngine {
         val unauthorized: Boolean = false
     )
 
-    /** 同一 Provider 的刷新失败文案去重，避免每 15 分钟往时间线里塞同一条错误。 */
-    private val lastRefreshError = ConcurrentHashMap<ProviderId, Pair<String, Long>>()
+    /** 同一账号的刷新失败文案去重，避免每 15 分钟往时间线里塞同一条错误。 */
+    private val lastRefreshError = ConcurrentHashMap<String, Pair<String, Long>>()
     private const val ERROR_DEDUPE_MILLIS: Long = 60L * 60_000L
 
-    /** 发一条保活消息。 */
-    suspend fun send(context: Context, provider: ProviderId, message: String): Result =
+    /** 给某个账号发一条保活消息。 */
+    suspend fun send(context: Context, account: Account, message: String): Result =
         withContext(Dispatchers.IO) {
-            val account = Store.account(provider)
+            val provider = account.provider
             if (!account.linked || !account.credentials.present) {
-                return@withContext Result(false, "账号未连接，请先在设置里连接 ${provider.label}")
+                return@withContext Result(
+                    false,
+                    "${AccountSupport.title(account)} 未连接，请先在设置里连接"
+                )
             }
             if (!Providers.has(provider)) {
                 return@withContext Result(false, "${provider.label} 接入尚未就绪，请稍后再试")
             }
+            val title = AccountSupport.title(account)
             val settings = Store.settingsNow()
             val outcome = WakeLocks.withLock(context) {
                 runCatching { Providers.of(provider).send(account, settings, message) }
@@ -89,7 +93,7 @@ object SendEngine {
             }
             val now = System.currentTimeMillis()
             if (outcome.ok) {
-                Store.updateQuota(provider) { quota ->
+                Store.updateQuotaById(account.id) { quota ->
                     QuotaMath.registerSend(
                         quota,
                         now,
@@ -100,20 +104,20 @@ object SendEngine {
                 Store.record(
                     provider = provider,
                     ok = true,
-                    text = "已发送「$message」",
+                    text = "$title 已发送「$message」",
                     detail = outcome.detail,
                     kind = EventKind.SEND,
                     at = now
                 )
                 Result(true, outcome.detail)
             } else {
-                Store.updateQuota(provider) {
+                Store.updateQuotaById(account.id) {
                     it.copy(lastSendOk = false, lastSendMessage = message)
                 }
                 Store.record(
                     provider = provider,
                     ok = false,
-                    text = "发送失败",
+                    text = "$title 发送失败",
                     detail = outcome.detail,
                     kind = EventKind.SEND,
                     at = now
@@ -123,19 +127,20 @@ object SendEngine {
         }
 
     /**
-     * 刷新官方额度。
+     * 刷新某个账号的官方额度。
      *
-     * @param record 是否往时间线写一条事件（自动刷新时可关掉，避免刷屏）
+     * @param record 是否往时间线写一条事件（自动刷新时也记录，便于用户排查账号问题）
      */
-    suspend fun refresh(context: Context, provider: ProviderId, record: Boolean = true): Result =
+    suspend fun refresh(context: Context, account: Account, record: Boolean = true): Result =
         withContext(Dispatchers.IO) {
-            val account = Store.account(provider)
+            val provider = account.provider
             if (!account.linked || !account.credentials.present) {
-                return@withContext Result(false, "账号未连接")
+                return@withContext Result(false, "${AccountSupport.title(account)} 未连接")
             }
             if (!Providers.has(provider)) {
                 return@withContext Result(false, "${provider.label} 接入尚未就绪")
             }
+            val title = AccountSupport.title(account)
             val settings = Store.settingsNow()
             val fetch = WakeLocks.withLock(context) {
                 runCatching { Providers.of(provider).fetchQuota(account, settings) }
@@ -144,14 +149,14 @@ object SendEngine {
             val now = System.currentTimeMillis()
             when (fetch) {
                 is QuotaFetch.Ok -> {
-                    Store.updateQuota(provider) { quota ->
+                    Store.updateQuotaById(account.id) { quota ->
                         QuotaMath.applyPatch(quota, fetch.patch, now)
                     }
                     if (record) {
                         Store.record(
                             provider = provider,
                             ok = true,
-                            text = "官方额度已更新",
+                            text = "$title 官方额度已更新",
                             detail = fetch.patch.officialDetail,
                             kind = EventKind.REFRESH,
                             at = now
@@ -166,24 +171,24 @@ object SendEngine {
                 }
 
                 is QuotaFetch.Fail -> {
-                    if (record) recordRefreshErrorOnce(provider, fetch.message, now)
+                    if (record) recordRefreshErrorOnce(account, title, fetch.message, now)
                     Result(false, fetch.message, fetch.unauthorized)
                 }
             }
         }
 
-    /** 刷新失败事件去重：同一文案 1 小时内只记录一次。 */
-    private fun recordRefreshErrorOnce(provider: ProviderId, message: String, now: Long) {
+    /** 刷新失败事件去重：同一账号同一文案 1 小时内只记录一次。 */
+    private fun recordRefreshErrorOnce(account: Account, title: String, message: String, now: Long) {
         val text = message.ifBlank { "额度刷新失败" }
-        val previous = lastRefreshError[provider]
+        val previous = lastRefreshError[account.id]
         if (previous != null && previous.first == text && now - previous.second < ERROR_DEDUPE_MILLIS) {
             return
         }
-        lastRefreshError[provider] = text to now
+        lastRefreshError[account.id] = text to now
         Store.record(
-            provider = provider,
+            provider = account.provider,
             ok = false,
-            text = "额度刷新失败",
+            text = "$title 额度刷新失败",
             detail = text,
             kind = EventKind.ERROR,
             at = now

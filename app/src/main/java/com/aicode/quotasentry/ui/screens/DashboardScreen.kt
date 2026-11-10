@@ -73,9 +73,9 @@ import com.aicode.quotasentry.ui.theme.quotaBrush
 @Composable
 fun DashboardScreen(
     now: Long,
-    onOpenAccount: (ProviderId) -> Unit,
+    onOpenAccount: (String) -> Unit,
     onOpenEvents: () -> Unit,
-    onOpenProvider: (ProviderId) -> Unit
+    onOpenProvider: (String) -> Unit
 ) {
     val p = QsTheme.palette
     val context = LocalContext.current
@@ -86,17 +86,32 @@ fun DashboardScreen(
     val events by Store.events.collectAsState()
     val running by Store.serviceRunning.collectAsState()
 
+    // 按 Provider 分组 + 连接时间排序，多账号时序号稳定（Claude 1 / Claude 2）。
+    val orderedAccounts = remember(accounts) {
+        accounts.sortedWith(
+            compareBy({ ProviderId.ordered.indexOf(it.provider) }, { it.linkedAt })
+        )
+    }
     val windowMillis = settings.windowMillis()
-    val nextRun = remember(rules, quotas, windowMillis, now) {
+
+    // 计划是「每个 Provider 一条」，预览下一次触发时取该服务第一个账号的官方重置时间。
+    val providerQuota = remember(accounts, quotas) {
+        ProviderId.ordered.associateWith { provider ->
+            val first = accounts.firstOrNull { it.provider == provider && it.linked }
+                ?: accounts.firstOrNull { it.provider == provider }
+            first?.let { quotas[it.id] }
+        }
+    }
+    val nextRun = remember(rules, providerQuota, windowMillis, now) {
         rules.filter { it.enabled }
             .mapNotNull { rule ->
-                val target = computeNextRun(rule, quotas[rule.provider], windowMillis, now)
+                val target = computeNextRun(rule, providerQuota[rule.provider], windowMillis, now)
                 if (target > 0L) rule.provider to target else null
             }
             .minByOrNull { it.second }
     }
     val lastSend = events.lastOrNull { it.kind == EventKind.SEND }
-    val linked = accounts.values.count { it.linked }
+    val linked = accounts.count { it.linked }
     val topInset = WindowInsets.statusBars.asPaddingValues().calculateTopPadding()
 
     LazyColumn(
@@ -117,7 +132,7 @@ fun DashboardScreen(
                     onOpenEvents = onOpenEvents,
                     onRefresh = {
                         ServiceController.refreshQuota(context, null)
-                        AppToast.show(context, "已请求刷新三家额度")
+                        AppToast.show(context, "已请求刷新全部账号额度")
                     },
                     onToggleGuard = {
                         if (running) {
@@ -140,7 +155,11 @@ fun DashboardScreen(
                 if (linked == 0) {
                     OnboardingCard(
                         hasRules = rules.any { it.enabled },
-                        onConnect = { onOpenAccount(ProviderId.ordered.firstOrNull { accounts[it]?.linked != true } ?: ProviderId.CLAUDE) }
+                        onConnect = {
+                            val target = orderedAccounts.firstOrNull { !it.linked }
+                                ?: Store.addAccount(ProviderId.CLAUDE)
+                            onOpenAccount(target.id)
+                        }
                     )
                 } else {
                     OverviewCard(
@@ -160,16 +179,19 @@ fun DashboardScreen(
             }
         }
 
-        items(ProviderId.ordered, key = { "provider_" + it.key }) { provider ->
-            val index = ProviderId.ordered.indexOf(provider)
-            StaggerItem(2 + index) {
+        items(orderedAccounts, key = { "account_" + it.id }) { account ->
+            val index = orderedAccounts.filter { it.provider == account.provider }
+                .indexOfFirst { it.id == account.id }
+                .coerceAtLeast(0)
+            val cardIndex = orderedAccounts.indexOf(account)
+            StaggerItem(2 + cardIndex) {
                 Spacer(Modifier.height(12.dp))
-                val account = accounts[provider] ?: Account.empty(provider)
-                val view = Store.viewFor(provider, now)
-                val quota = quotas[provider] ?: Store.quota(provider)
+                val view = Store.viewFor(account, now)
+                val quota = quotas[account.id] ?: Store.quotaFor(account)
+                val providerLinked = accounts.count { it.provider == account.provider && it.linked }
                 ProviderCard(
-                    provider = provider,
                     account = account,
+                    displayName = account.displayName(index),
                     view = view,
                     quota = quota,
                     running = running,
@@ -177,18 +199,21 @@ fun DashboardScreen(
                     windowMillis = windowMillis,
                     now = now,
                     onClick = {
-                        if (account.linked) onOpenProvider(provider) else onOpenAccount(provider)
+                        if (account.linked) onOpenProvider(account.id) else onOpenAccount(account.id)
                     },
-                    onConnect = { onOpenAccount(provider) },
+                    onConnect = { onOpenAccount(account.id) },
                     onSendNow = {
-                        ServiceController.sendNow(context, provider)
-                        AppToast.show(context, "已请求向 ${provider.label} 发送保活消息")
+                        ServiceController.sendNow(context, account.provider)
+                        AppToast.show(
+                            context,
+                            "已请求向 ${account.provider.label} 的 $providerLinked 个已连接账号发送保活消息"
+                        )
                     },
                     onRefresh = {
-                        ServiceController.refreshQuota(context, provider)
-                        AppToast.show(context, "正在刷新 ${provider.label} 额度")
+                        ServiceController.refreshQuota(context, account.provider)
+                        AppToast.show(context, "正在刷新 ${account.provider.label} 的 $providerLinked 个账号额度")
                     },
-                    onMore = { onOpenProvider(provider) }
+                    onMore = { onOpenProvider(account.id) }
                 )
             }
         }
@@ -207,13 +232,13 @@ fun DashboardScreen(
 private fun DashboardHeader(
     now: Long,
     running: Boolean,
-    accounts: Map<ProviderId, Account>,
+    accounts: List<Account>,
     onOpenEvents: () -> Unit,
     onRefresh: () -> Unit,
     onToggleGuard: () -> Unit
 ) {
     val p = QsTheme.palette
-    val linked = accounts.values.count { it.linked }
+    val linked = accounts.count { it.linked }
     Row(verticalAlignment = Alignment.CenterVertically) {
         Column(Modifier.weight(1f)) {
             MText(text = "额度哨兵", style = QsType.largeTitle, color = p.text, maxLines = 1)
@@ -222,7 +247,7 @@ private fun DashboardHeader(
                 text = when {
                     !running -> "守护未启动"
                     linked == 0 -> "还没有连接账号"
-                    else -> "已连接 $linked 家 · 守护中"
+                    else -> "已连接 $linked 个账号 · 守护中"
                 },
                 style = QsType.caption,
                 color = p.dim,
@@ -239,7 +264,7 @@ private fun DashboardHeader(
 
 @Composable
 private fun OverviewCard(
-    accounts: Map<ProviderId, Account>,
+    accounts: List<Account>,
     running: Boolean,
     backgroundEnabled: Boolean,
     lastSend: SendEvent?,
@@ -273,13 +298,14 @@ private fun OverviewCard(
         Spacer(Modifier.height(12.dp))
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             ProviderId.ordered.forEach { provider ->
-                val account = accounts[provider] ?: Account.empty(provider)
+                val group = accounts.filter { it.provider == provider }
+                val linkedGroup = group.filter { it.linked }
                 Column(Modifier.weight(1f)) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Box(
                             Modifier
                                 .size(7.dp)
-                                .background(if (account.linked) p.ok else p.faint, CircleShape)
+                                .background(if (linkedGroup.isNotEmpty()) p.ok else p.faint, CircleShape)
                         )
                         Spacer(Modifier.width(5.dp))
                         MText(
@@ -291,8 +317,13 @@ private fun OverviewCard(
                     }
                     Spacer(Modifier.height(3.dp))
                     MText(
-                        text = if (account.linked) (account.plan.ifBlank { "已连接" }) else "未连接",
-                        color = if (account.linked) p.dim else p.faint,
+                        text = when {
+                            linkedGroup.isNotEmpty() && group.size > 1 -> "已连接 ${linkedGroup.size}/${group.size}"
+                            linkedGroup.isNotEmpty() -> linkedGroup.first().plan.ifBlank { "已连接" }
+                            group.isNotEmpty() -> "未连接"
+                            else -> "未添加"
+                        },
+                        color = if (linkedGroup.isNotEmpty()) p.dim else p.faint,
                         style = QsType.tiny,
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis
@@ -450,8 +481,8 @@ private fun StepRow(index: Int, title: String, detail: String, done: Boolean) {
 
 @Composable
 private fun ProviderCard(
-    provider: ProviderId,
     account: Account,
+    displayName: String,
     view: QuotaView,
     quota: QuotaState,
     running: Boolean,
@@ -465,6 +496,7 @@ private fun ProviderCard(
     onMore: () -> Unit
 ) {
     val p = QsTheme.palette
+    val provider = account.provider
     val official = view.source == QuotaSource.OFFICIAL
     GlassCard(
         onClick = onClick,
@@ -475,8 +507,16 @@ private fun ProviderCard(
             Spacer(Modifier.width(12.dp))
             Column(Modifier.weight(1f)) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    MText(text = provider.label, color = p.text, style = QsType.cardTitle, maxLines = 1)
-                    if (account.plan.isNotBlank()) {
+                    MText(
+                        text = displayName,
+                        color = p.text,
+                        style = QsType.cardTitle,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f, fill = false)
+                    )
+                    // 只有「邮箱/组织名 + 计划」同时存在时才额外挂计划徽标，避免重复。
+                    if (account.label.isNotBlank() && account.plan.isNotBlank()) {
                         Spacer(Modifier.width(7.dp))
                         GlassChip(text = account.plan, height = 22.dp)
                     }
@@ -731,9 +771,9 @@ fun EventsSheet(open: Boolean, onDismiss: () -> Unit) {
 /** 单个 Provider 的额度明细 + 手动重置入口。 */
 @Composable
 fun ProviderDetailSheet(
-    provider: ProviderId?,
+    accountId: String?,
     onDismiss: () -> Unit,
-    onOpenAccount: (ProviderId) -> Unit,
+    onOpenAccount: (String) -> Unit,
     onOpenEvents: () -> Unit
 ) {
     val p = QsTheme.palette
@@ -745,29 +785,40 @@ fun ProviderDetailSheet(
     val running by Store.serviceRunning.collectAsState()
     val now = rememberNow()
 
-    var shown by remember { mutableStateOf(provider) }
-    LaunchedEffect(provider) { if (provider != null) shown = provider }
-    val current = shown
+    var shownId by remember { mutableStateOf(accountId) }
+    LaunchedEffect(accountId) { if (accountId != null) shownId = accountId }
+    val current = accounts.firstOrNull { it.id == shownId }
+    LaunchedEffect(accountId, accounts) {
+        if (accountId != null && accounts.none { it.id == accountId }) onDismiss()
+    }
+    val provider = current?.provider
+    val displayName = current?.let { accountDisplayName(it, accounts) } ?: "额度详情"
 
     GlassSheet(
-        open = provider != null,
+        open = accountId != null,
         onDismiss = onDismiss,
-        title = current?.let { "${it.label} · 额度详情" } ?: "额度详情",
-        subtitle = current?.let { provider -> if (accounts[provider]?.linked == true) "官方数据优先，缺失时用本地窗口估算" else "账号未连接" } ?: ""
+        title = current?.let { accountDisplayName(it, accounts) + " · 额度详情" } ?: "额度详情",
+        subtitle = when {
+            current == null -> ""
+            current.linked -> "官方数据优先，缺失时用本地窗口估算"
+            else -> "账号未连接"
+        }
     ) {
-        if (current == null) return@GlassSheet
-        val account = accounts[current] ?: Account.empty(current)
-        val quota = quotas[current] ?: Store.quota(current)
-        val view = Store.viewFor(current, now)
+        if (current == null || provider == null) return@GlassSheet
+        val account = current
+        val quota = quotas[account.id] ?: Store.quotaFor(account)
+        val view = Store.viewFor(account, now)
         val official = view.source == QuotaSource.OFFICIAL
-        val lastEvent = events.lastOrNull { it.provider == current }
+        val lastEvent = events.lastOrNull { it.provider == provider }
+        val providerAccounts = accounts.filter { it.provider == provider }
+        val linkedProvider = providerAccounts.count { it.linked }
 
         Spacer(Modifier.height(6.dp))
         Row(verticalAlignment = Alignment.CenterVertically) {
-            ProviderLogo(provider = current, size = 46.dp)
+            ProviderLogo(provider = provider, size = 46.dp)
             Spacer(Modifier.width(12.dp))
             Column(Modifier.weight(1f)) {
-                MText(text = current.label, color = p.text, style = QsType.title, maxLines = 1)
+                MText(text = displayName, color = p.text, style = QsType.title, maxLines = 1)
                 Spacer(Modifier.height(3.dp))
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     SourceBadge(sourceLabel = view.sourceLabel, official = official)
@@ -795,7 +846,12 @@ fun ProviderDetailSheet(
             elevation = 0.dp,
             padding = PaddingValues(14.dp)
         ) {
-            RowLabel(label = "剩余额度", value = quotaSummary(view, now))
+            RowLabel(label = "账号", value = displayName)
+            Spacer(Modifier.height(8.dp))
+            RowLabel(
+                label = "剩余额度",
+                value = quotaSummary(view, now)
+            )
             Spacer(Modifier.height(8.dp))
             RowLabel(label = "数据来源", value = view.sourceLabel)
             Spacer(Modifier.height(8.dp))
@@ -821,7 +877,14 @@ fun ProviderDetailSheet(
             }
             if (account.label.isNotBlank()) {
                 Spacer(Modifier.height(8.dp))
-                RowLabel(label = "账号", value = account.label)
+                RowLabel(label = "邮箱 / 标识", value = account.label)
+            }
+            if (providerAccounts.size > 1) {
+                Spacer(Modifier.height(8.dp))
+                RowLabel(
+                    label = "${provider.shortLabel} 账号",
+                    value = "共 ${providerAccounts.size} 个 · 已连接 $linkedProvider"
+                )
             }
             if (lastEvent != null) {
                 Spacer(Modifier.height(8.dp))
@@ -846,18 +909,18 @@ fun ProviderDetailSheet(
             GlassButton(
                 text = "去连接账号",
                 icon = QsIcon.LINK,
-                onClick = { onOpenAccount(current) },
+                onClick = { onOpenAccount(account.id) },
                 modifier = Modifier.fillMaxWidth()
             )
             Spacer(Modifier.height(10.dp))
         } else {
             Spacer(Modifier.height(16.dp))
             GlassButton(
-                text = "立即续命",
+                text = "立即续命（该服务 $linkedProvider 个账号）",
                 icon = QsIcon.BOLT,
                 onClick = {
-                    ServiceController.sendNow(context, current)
-                    AppToast.show(context, "已请求发送")
+                    ServiceController.sendNow(context, provider)
+                    AppToast.show(context, "已请求向 ${provider.label} 的 $linkedProvider 个账号发送")
                 },
                 modifier = Modifier.fillMaxWidth()
             )
@@ -868,8 +931,8 @@ fun ProviderDetailSheet(
                     icon = QsIcon.REFRESH,
                     style = GlassButtonStyle.SECONDARY,
                     onClick = {
-                        ServiceController.refreshQuota(context, current)
-                        AppToast.show(context, "正在刷新额度")
+                        ServiceController.refreshQuota(context, provider)
+                        AppToast.show(context, "正在刷新 ${provider.label} 的 $linkedProvider 个账号额度")
                     },
                     modifier = Modifier.weight(1f)
                 )
@@ -879,7 +942,7 @@ fun ProviderDetailSheet(
                     style = GlassButtonStyle.DANGER,
                     onClick = {
                         // 手动重置：清空本地窗口计数与官方快照，立刻重新开始估算。
-                        Store.updateQuota(current) { q ->
+                        Store.updateQuotaById(account.id) { q ->
                             q.copy(
                                 localSent = 0,
                                 localWindowStart = System.currentTimeMillis(),
@@ -901,7 +964,7 @@ fun ProviderDetailSheet(
                     text = "编辑 Cookie",
                     icon = QsIcon.CODE,
                     style = GlassButtonStyle.SECONDARY,
-                    onClick = { onOpenAccount(current) },
+                    onClick = { onOpenAccount(account.id) },
                     modifier = Modifier.weight(1f),
                     height = 44.dp
                 )

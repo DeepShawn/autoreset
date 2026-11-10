@@ -27,13 +27,13 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.aicode.quotasentry.auth.OAuthFlow
 import com.aicode.quotasentry.auth.OAuthState
-import com.aicode.quotasentry.core.Account
 import com.aicode.quotasentry.core.ConnectResult
 import com.aicode.quotasentry.core.Formatters
 import com.aicode.quotasentry.core.ProviderId
@@ -54,34 +54,48 @@ import com.aicode.quotasentry.ui.theme.QsType
 import kotlinx.coroutines.launch
 
 /**
- * 账号连接 BottomSheet：粘贴 Cookie / Chrome 授权登录（OAuth）/ 测试连接 / 断开连接。
+ * 账号连接 BottomSheet（多账号版）：粘贴 Cookie / Chrome 授权登录（OAuth）/
+ * 测试连接 / 断开 / 再添加一个账号 / 删除账号。
  *
- * 数据全部写回 [Store]；验证请求走 data 层的 [com.aicode.quotasentry.data.Providers]。
+ * 参数是账号 id 而不是 Provider：同一个 Provider 可以连接多个账号，凭据、额度、发送记录都按 id 存。
  */
 @Composable
-fun AccountSheet(provider: ProviderId?, onDismiss: () -> Unit) {
+fun AccountSheet(accountId: String?, onDismiss: () -> Unit) {
     val p = QsTheme.palette
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val accounts by Store.accounts.collectAsState()
 
-    // Sheet 关闭动画期间仍需展示原内容，所以记住最近一次打开的 provider。
-    var shown by remember { mutableStateOf(provider) }
-    LaunchedEffect(provider) { if (provider != null) shown = provider }
+    // Sheet 关闭动画期间仍展示原账号；「再添加账号」时在内部切换 activeId，不用关掉重开。
+    var shownId by remember { mutableStateOf(accountId) }
+    var activeId by remember { mutableStateOf(accountId) }
+    LaunchedEffect(accountId) {
+        if (accountId != null) {
+            shownId = accountId
+            activeId = accountId
+        }
+    }
+    val current = accounts.firstOrNull { it.id == (activeId ?: shownId) }
 
-    val current = shown
-    var cookie by remember(current) { mutableStateOf(current?.let { Store.account(it).credentials.cookie } ?: "") }
-    var accessToken by remember(current) { mutableStateOf(current?.let { Store.account(it).credentials.accessToken } ?: "") }
-    var hidden by remember(current) { mutableStateOf(true) }
-    var verifying by remember(current) { mutableStateOf(false) }
-    var message by remember(current) { mutableStateOf<String?>(null) }
-    var messageOk by remember(current) { mutableStateOf(false) }
+    // 账号被别处删除（或「删除这个账号」后）时自动收起，避免弹窗空壳。
+    LaunchedEffect(accountId, accounts) {
+        if (accountId != null && accounts.none { it.id == accountId }) onDismiss()
+    }
+
+    var cookie by remember(current?.id) { mutableStateOf(current?.credentials?.cookie.orEmpty()) }
+    var accessToken by remember(current?.id) { mutableStateOf(current?.credentials?.accessToken.orEmpty()) }
+    var hidden by remember(current?.id) { mutableStateOf(true) }
+    var verifying by remember(current?.id) { mutableStateOf(false) }
+    var message by remember(current?.id) { mutableStateOf<String?>(null) }
+    var messageOk by remember(current?.id) { mutableStateOf(false) }
+    // 记录本次 Chrome 授权是针对哪个账号发起的，成功后只刷这个账号的 token 输入框。
+    var oauthAccountId by remember { mutableStateOf<String?>(null) }
 
     val oauthState by OAuthFlow.state.collectAsState()
     val lifecycleOwner = LocalLifecycleOwner.current
 
     // Claude 授权：Chrome 里登录并复制授权码后，回到前台自动读剪贴板兑换 token。
-    DisposableEffect(lifecycleOwner, current) {
+    DisposableEffect(lifecycleOwner, current?.id) {
         val observer = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_RESUME) {
                 val waiting = OAuthFlow.state.value
@@ -100,12 +114,14 @@ fun AccountSheet(provider: ProviderId?, onDismiss: () -> Unit) {
     LaunchedEffect(oauthState) {
         when (val result = oauthState) {
             is OAuthState.Success -> {
-                if (current == result.provider) {
-                    accessToken = Store.account(result.provider).credentials.accessToken
+                val targetId = oauthAccountId
+                if (targetId != null && targetId == activeId) {
+                    accessToken = Store.accountById(targetId)?.credentials?.accessToken.orEmpty()
                     messageOk = true
                     message = "已连接：" + result.label
                 }
                 AppToast.show(context, "已连接：" + result.label)
+                oauthAccountId = null
                 OAuthFlow.clearResult()
             }
 
@@ -113,37 +129,39 @@ fun AccountSheet(provider: ProviderId?, onDismiss: () -> Unit) {
         }
     }
 
-    fun persist(target: ProviderId) {
-        Store.updateAccount(target) { account ->
-            account.copy(
-                credentials = account.credentials.copy(
-                    cookie = cookie.trim(),
-                    accessToken = accessToken.trim()
-                )
-            )
-        }
+    fun persist(id: String) {
+        AccountFlow.saveCredentials(id, cookie, accessToken)
     }
 
     fun dismiss() {
-        shown?.let { persist(it) }
+        activeId?.let { persist(it) }
         onDismiss()
     }
 
     GlassSheet(
-        open = provider != null,
+        open = accountId != null,
         onDismiss = { dismiss() },
         title = "连接账号",
-        subtitle = "凭据只保存在本机，仅用于访问你自己的账号"
+        subtitle = "同一服务可以连接多个账号；凭据只保存在本机"
     ) {
         if (current == null) return@GlassSheet
-        val account: Account = accounts[current] ?: Account.empty(current)
+        val provider = current.provider
+        val siblings = accounts.filter { it.provider == provider }.sortedBy { it.linkedAt }
+        val displayName = accountDisplayName(current, accounts)
+        val account = current
 
         Spacer(Modifier.height(6.dp))
         Row(verticalAlignment = Alignment.CenterVertically) {
-            ProviderLogo(provider = current, size = 46.dp)
+            ProviderLogo(provider = provider, size = 46.dp)
             Spacer(Modifier.width(12.dp))
             Column(Modifier.weight(1f)) {
-                MText(text = current.label, color = p.text, style = QsType.title, maxLines = 1)
+                MText(
+                    text = displayName,
+                    color = p.text,
+                    style = QsType.title,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
                 Spacer(Modifier.height(3.dp))
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     StatusDot(
@@ -153,23 +171,30 @@ fun AccountSheet(provider: ProviderId?, onDismiss: () -> Unit) {
                     )
                     Spacer(Modifier.width(6.dp))
                     MText(
-                        text = if (account.linked) {
-                            accountStatusText(account) + if (account.label.isNotBlank()) " · ${account.label}" else ""
-                        } else {
-                            "未连接"
+                        text = buildString {
+                            append(provider.label)
+                            append(" · ")
+                            append(if (account.linked) "已连接" else "未连接")
+                            if (account.plan.isNotBlank()) append(" · ").append(account.plan)
                         },
                         color = p.dim,
                         style = QsType.caption,
-                        maxLines = 1
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
                     )
                 }
             }
             if (account.linked) {
-                GlassChip(text = "断开", onClick = {
-                    AccountFlow.disconnect(current)
-                    AppToast.show(context, "已断开 ${current.label}")
-                    onDismiss()
-                }, height = 30.dp)
+                GlassChip(
+                    text = "断开",
+                    onClick = {
+                        AccountFlow.disconnect(account.id)
+                        messageOk = true
+                        message = "已断开，可重新粘贴 Cookie 或 Chrome 授权登录"
+                        AppToast.show(context, "已断开 $displayName")
+                    },
+                    height = 30.dp
+                )
             }
         }
 
@@ -182,12 +207,12 @@ fun AccountSheet(provider: ProviderId?, onDismiss: () -> Unit) {
             )
         }
 
-        if (!account.lastError.isNullOrBlank() && !account.linked && account.lastError != message) {
+        if (account.lastError.isNotBlank() && !account.linked && account.lastError != message) {
             Spacer(Modifier.height(10.dp))
             GlassCard(
-                shape = androidx.compose.foundation.shape.RoundedCornerShape(16.dp),
+                shape = RoundedCornerShape(16.dp),
                 elevation = 0.dp,
-                padding = androidx.compose.foundation.layout.PaddingValues(12.dp),
+                padding = PaddingValues(12.dp),
                 glow = p.danger.copy(alpha = 0.10f)
             ) {
                 Row(verticalAlignment = Alignment.Top) {
@@ -203,9 +228,9 @@ fun AccountSheet(provider: ProviderId?, onDismiss: () -> Unit) {
             Spacer(Modifier.height(10.dp))
             val tone = if (messageOk) p.ok else p.danger
             GlassCard(
-                shape = androidx.compose.foundation.shape.RoundedCornerShape(16.dp),
+                shape = RoundedCornerShape(16.dp),
                 elevation = 0.dp,
-                padding = androidx.compose.foundation.layout.PaddingValues(12.dp),
+                padding = PaddingValues(12.dp),
                 glow = tone.copy(alpha = 0.10f)
             ) {
                 Row(verticalAlignment = Alignment.Top) {
@@ -222,7 +247,7 @@ fun AccountSheet(provider: ProviderId?, onDismiss: () -> Unit) {
         GlassTextField(
             value = cookie,
             onValueChange = { cookie = it },
-            placeholder = requiredCookieHint(current),
+            placeholder = requiredCookieHint(provider),
             singleLine = false,
             minLines = 4,
             maxLines = 8,
@@ -248,36 +273,41 @@ fun AccountSheet(provider: ProviderId?, onDismiss: () -> Unit) {
                         AppToast.show(context, "剪贴板里没有文字")
                     } else {
                         cookie = clip
-                        persist(current)
+                        persist(account.id)
                         AppToast.show(context, "已粘贴 Cookie")
                     }
                 },
                 height = 34.dp
             )
             // 只有 Claude / ChatGPT 有可用的 OAuth 额度接口；Gemini 仍用 Cookie。
-            if (current in OAuthFlow.supported) {
+            if (provider in OAuthFlow.supported) {
                 GlassChip(
                     text = "Chrome 授权登录",
                     icon = QsIcon.GLOBE,
                     onClick = {
-                        persist(current)
-                        OAuthFlow.launch(context, current)
+                        persist(account.id)
+                        oauthAccountId = account.id
+                        OAuthFlow.launch(context, provider, account.id)
                     },
                     height = 34.dp
                 )
             }
         }
 
-        if (current in OAuthFlow.supported) {
+        if (provider in OAuthFlow.supported) {
             Spacer(Modifier.height(10.dp))
             OAuthPanel(
-                provider = current,
+                provider = provider,
                 state = oauthState,
                 onLaunch = {
-                    persist(current)
-                    OAuthFlow.launch(context, current)
+                    persist(account.id)
+                    oauthAccountId = account.id
+                    OAuthFlow.launch(context, provider, account.id)
                 },
-                onCancel = { OAuthFlow.cancel() },
+                onCancel = {
+                    oauthAccountId = null
+                    OAuthFlow.cancel()
+                },
                 onCapture = {
                     if (!OAuthFlow.captureFromClipboard(context)) {
                         AppToast.show(context, "剪贴板里没有找到授权码，请先在 Chrome 复制")
@@ -288,10 +318,10 @@ fun AccountSheet(provider: ProviderId?, onDismiss: () -> Unit) {
 
         // Claude 用 OAuth 令牌读官方 5h / 7d 用量；ChatGPT 用 accessToken 兜底。
         // Gemini 没有可用的令牌接口，不显示这一栏。
-        if (current != ProviderId.GEMINI) {
+        if (provider != ProviderId.GEMINI) {
             Spacer(Modifier.height(12.dp))
             MText(
-                text = if (current == ProviderId.CLAUDE) {
+                text = if (provider == ProviderId.CLAUDE) {
                     "Claude Code OAuth 令牌（可选，额度更准）"
                 } else {
                     "Access Token（可选，兜底）"
@@ -303,7 +333,7 @@ fun AccountSheet(provider: ProviderId?, onDismiss: () -> Unit) {
             GlassTextField(
                 value = accessToken,
                 onValueChange = { accessToken = it },
-                placeholder = if (current == ProviderId.CLAUDE) {
+                placeholder = if (provider == ProviderId.CLAUDE) {
                     "sk-ant-oat01-…（~/.claude/.credentials.json 里的 accessToken）"
                 } else {
                     "eyJhbGciOi…（浏览器 chatgpt.com/api/auth/session 里的 accessToken）"
@@ -315,7 +345,7 @@ fun AccountSheet(provider: ProviderId?, onDismiss: () -> Unit) {
             )
             Spacer(Modifier.height(6.dp))
             MText(
-                text = if (current == ProviderId.CLAUDE) {
+                text = if (provider == ProviderId.CLAUDE) {
                     "仅用于读取官方 5 小时 / 7 天用量；发送保活消息仍需要上面的 claude.ai Cookie。只有令牌没有 Cookie 时不能发送。"
                 } else {
                     "Cookie 失效时可以只填 accessToken 查额度 / 发送消息。"
@@ -333,11 +363,11 @@ fun AccountSheet(provider: ProviderId?, onDismiss: () -> Unit) {
                 loading = verifying,
                 enabled = !verifying,
                 onClick = {
-                    persist(current)
+                    persist(account.id)
                     verifying = true
                     message = null
                     scope.launch {
-                        val result = AccountFlow.verify(current)
+                        val result = AccountFlow.verify(account.id)
                         verifying = false
                         messageOk = result is ConnectResult.Ok
                         message = when (result) {
@@ -359,7 +389,7 @@ fun AccountSheet(provider: ProviderId?, onDismiss: () -> Unit) {
                 icon = QsIcon.CHECK,
                 style = GlassButtonStyle.SECONDARY,
                 onClick = {
-                    persist(current)
+                    persist(account.id)
                     AppToast.show(context, "已保存，可点测试连接验证")
                 },
                 modifier = Modifier.weight(1f)
@@ -370,11 +400,11 @@ fun AccountSheet(provider: ProviderId?, onDismiss: () -> Unit) {
         MText(text = "需要哪些 Cookie", color = p.dim, style = QsType.sectionTitle)
         Spacer(Modifier.height(8.dp))
         GlassCard(
-            shape = androidx.compose.foundation.shape.RoundedCornerShape(18.dp),
+            shape = RoundedCornerShape(18.dp),
             elevation = 0.dp,
-            padding = androidx.compose.foundation.layout.PaddingValues(14.dp)
+            padding = PaddingValues(14.dp)
         ) {
-            cookieHelp(current).forEach { line ->
+            cookieHelp(provider).forEach { line ->
                 MText(
                     text = "· $line",
                     color = p.dim,
@@ -383,7 +413,58 @@ fun AccountSheet(provider: ProviderId?, onDismiss: () -> Unit) {
                 )
             }
         }
+
+        // ── 多账号管理 ──────────────────────────────────────────────────────
+        Spacer(Modifier.height(18.dp))
+        MText(text = "多账号", color = p.dim, style = QsType.sectionTitle)
         Spacer(Modifier.height(8.dp))
+        MText(
+            text = "同一个 ${provider.label} 可以连接多个账号，首页会按账号分别显示额度；计划仍然按服务配置，到点发送给该服务的全部已连接账号。",
+            color = p.faint,
+            style = QsType.tiny
+        )
+        Spacer(Modifier.height(10.dp))
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            GlassButton(
+                text = "再添加一个账号",
+                icon = QsIcon.PLUS,
+                style = GlassButtonStyle.SECONDARY,
+                onClick = {
+                    persist(account.id)
+                    val created = Store.addAccount(provider)
+                    activeId = created.id
+                    shownId = created.id
+                    message = null
+                    AppToast.show(context, "已添加新的 ${provider.label} 账号，请填入凭据")
+                },
+                modifier = Modifier.weight(1f),
+                height = 46.dp
+            )
+            if (siblings.size > 1) {
+                GlassButton(
+                    text = "删除这个账号",
+                    icon = QsIcon.TRASH,
+                    style = GlassButtonStyle.DANGER,
+                    onClick = {
+                        AccountFlow.remove(account.id)
+                        AppToast.show(context, "已删除账号")
+                        onDismiss()
+                    },
+                    modifier = Modifier.weight(1f),
+                    height = 46.dp
+                )
+            }
+        }
+        if (siblings.size <= 1) {
+            Spacer(Modifier.height(7.dp))
+            MText(
+                text = "每个服务至少保留一个账号槽位；不需要时点上面的「断开」即可清空凭据。",
+                color = p.faint,
+                style = QsType.tiny
+            )
+        }
+
+        Spacer(Modifier.height(12.dp))
         MText(
             text = "提示：这是非官方接口，需要用到你浏览器的登录态；凭据只存在本机，不会上传到任何服务器。",
             color = p.faint,
@@ -429,7 +510,7 @@ private fun OAuthPanel(
         when (mine) {
             is OAuthState.Waiting -> {
                 Row(verticalAlignment = Alignment.Top) {
-                    QsIcon(QsIcon.GLOBE, size = 15.dp, tint = p.accentInk)
+                    QsIcon(QsIcon.GLOBE, size = 15.dp, tint = p.accent)
                     Spacer(Modifier.width(8.dp))
                     MText(
                         text = mine.hint,
@@ -527,10 +608,4 @@ private fun cookieHelp(provider: ProviderId): List<String> = when (provider) {
         "建议同时带上 __Secure-1PSIDTS、__Secure-3PSID",
         "额度按本地窗口估算，无法读取官方用量"
     )
-}
-
-/** 供设置页 / 首页弹 AccountSheet 时复用的小封装（保持调用点简洁）。 */
-@Composable
-fun AccountSheetHost(provider: ProviderId?, onDismiss: () -> Unit) {
-    AccountSheet(provider = provider, onDismiss = onDismiss)
 }

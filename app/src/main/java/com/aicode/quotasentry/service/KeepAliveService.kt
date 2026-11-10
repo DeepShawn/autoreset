@@ -9,6 +9,7 @@ import android.net.NetworkCapabilities
 import android.os.Build
 import android.os.IBinder
 import android.util.Log
+import com.aicode.quotasentry.core.Account
 import com.aicode.quotasentry.core.DefaultMessages
 import com.aicode.quotasentry.core.ProviderId
 import com.aicode.quotasentry.core.ScheduleMath
@@ -28,15 +29,16 @@ import kotlinx.coroutines.sync.withLock
 import java.util.concurrent.ConcurrentHashMap
 
 /**
- * 后台常驻服务。
+ * 后台常驻服务（支持同一 Provider 多账号）。
  *
  * 设计要点：
  * - specialUse 前台服务：`onCreate` 里立刻 `startForeground`，满足 Android 12+ 的 5 秒限制；
  * - `START_STICKY` + manifest 的 `stopWithTask=false`：划掉任务栏不退出，`onTaskRemoved` 再用
  *   AlarmManager 5 秒后兜底重启；
- * - 服务内协程每 30 秒 tick 一次（没有连接账号时空转间隔放宽到 5 分钟），到点的计划执行发送；
+ * - 服务内协程每 30 秒 tick 一次（没有连接账号时空转间隔放宽到 5 分钟）；
+ * - 计划仍然「每个 Provider 一条」，到点时对该 Provider 下**所有已连接账号**逐个发送；
  * - 网络请求期间才拿 WakeLock（2 分钟超时），其余时间只 `delay`，不持锁长睡；
- * - 连续失败 3 次才提醒一次，成功后计数清零，避免轰炸通知；
+ * - 连续失败按**账号**计数，3 次才提醒一次，成功后清零，避免轰炸通知；
  * - 用户关闭总开关（`settings.backgroundEnabled=false`）时 `stopSelf` 并清掉兜底闹钟。
  */
 class KeepAliveService : Service() {
@@ -47,8 +49,9 @@ class KeepAliveService : Service() {
     /** 所有会写 Store / 发网络请求的操作串行执行，避免 tick 与手动命令撞车。 */
     private val operationMutex = Mutex()
 
-    private val failureStreak = ConcurrentHashMap<ProviderId, Int>()
-    private val lastFailureAlertAt = ConcurrentHashMap<ProviderId, Long>()
+    /** 连续失败计数按账号 id 隔离。 */
+    private val failureStreak = ConcurrentHashMap<String, Int>()
+    private val lastFailureAlertAt = ConcurrentHashMap<String, Long>()
 
     @Volatile
     private var pausedUntil: Long = 0L
@@ -170,11 +173,12 @@ class KeepAliveService : Service() {
 
     private fun buildOngoingNotification(settings: Settings): android.app.Notification {
         val now = System.currentTimeMillis()
-        val connected = Store.accounts.value.values.count { it.linked }
+        // 多账号：这里统计的是账号数量，不再是 Provider 家数
+        val accountCount = AccountSupport.linked().size
         val nextAt = nextSendAt(now)
         return NotificationHelper.buildServiceNotification(
             context = this,
-            connectedCount = connected,
+            accountCount = accountCount,
             nextSendAt = nextAt,
             pausedUntil = pausedUntil,
             now = now,
@@ -197,7 +201,7 @@ class KeepAliveService : Service() {
         }.onFailure { Log.w(TAG, "更新常驻通知失败：${it.message}") }
     }
 
-    /** 下一次计划发送时刻（epoch ms），没有未来计划返回 0。 */
+    /** 下一次计划发送时刻（epoch ms，所有启用规则里最早的），没有未来计划返回 0。 */
     private fun nextSendAt(now: Long): Long {
         val window = Store.settingsNow().windowMillis()
         return Store.rules.value
@@ -209,7 +213,7 @@ class KeepAliveService : Service() {
                     ScheduleMath.computeNext(
                         rule,
                         now,
-                        Store.quota(rule.provider).officialResetAt,
+                        AccountSupport.nextResetAt(rule.provider, now, window),
                         window
                     )
                 }
@@ -225,7 +229,7 @@ class KeepAliveService : Service() {
         loopJob = serviceScope.launch {
             while (isActive) {
                 tick()
-                val idle = Store.accounts.value.values.none { it.linked }
+                val idle = !AccountSupport.hasLinked()
                 delay(if (idle) IDLE_TICK_MILLIS else TICK_MILLIS)
             }
         }
@@ -257,8 +261,7 @@ class KeepAliveService : Service() {
             updateOngoingNotification(force = true)
         }
 
-        val hasLinked = Store.accounts.value.values.any { it.linked }
-        if (!hasLinked) {
+        if (!AccountSupport.hasLinked()) {
             // 没有连接账号：保持常驻但空转，5 分钟一次（见 startLoop 的 idle 间隔）
             updateOngoingNotification(now = now)
             AlarmScheduler.scheduleNext(this, now)
@@ -271,84 +274,97 @@ class KeepAliveService : Service() {
         AlarmScheduler.scheduleNext(this, now)
     }
 
-    /** 逐条检查到点的计划并执行发送。 */
+    /** 逐条检查到点的计划：一条计划 → 该 Provider 下所有已连接账号。 */
     private suspend fun runDueRules(now: Long, settings: Settings) {
         if (pausedUntil > now) return
         val window = settings.windowMillis()
         for (rule in Store.rules.value.filter { it.enabled }) {
-            val account = Store.account(rule.provider)
-            if (!account.linked) continue
+            val accounts = AccountSupport.linkedFor(rule.provider)
+            if (accounts.isEmpty()) continue
+            val resetAt = AccountSupport.nextResetAt(rule.provider, now, window)
 
             val nextAt = rule.nextRunAt
             if (nextAt <= 0L) {
                 // 首次运行 / 刚启用：只计算下一次，不立刻补发
-                val computed = ScheduleMath.computeNext(
-                    rule,
-                    now,
-                    Store.quota(rule.provider).officialResetAt,
-                    window
-                )
+                val computed = ScheduleMath.computeNext(rule, now, resetAt, window)
                 Store.updateRule(rule.id) { it.copy(nextRunAt = computed) }
                 continue
             }
             if (!BackgroundMath.isRuleDue(rule, now, nextAt)) continue
             // 关机/休眠太久，已错过窗口：重排而不是补发，避免一次发一堆
             if (BackgroundMath.isStaleMiss(now, nextAt, window)) {
-                val computed = ScheduleMath.computeNext(
-                    rule,
-                    now,
-                    Store.quota(rule.provider).officialResetAt,
-                    window
-                )
+                val computed = ScheduleMath.computeNext(rule, now, resetAt, window)
                 Store.updateRule(rule.id) { it.copy(nextRunAt = computed) }
                 continue
             }
             if (settings.wifiOnly && !isOnWifi()) continue
 
-            executeRule(rule, settings, now)
+            executeRule(rule, accounts, settings, now)
         }
     }
 
-    /** 执行一条计划：发送 → 成功后按需刷新额度 → 推进下一次计划 → 通知。 */
-    private suspend fun executeRule(rule: ScheduleRule, settings: Settings, now: Long) {
-        // 重新读一次，UI 可能刚改过这条规则
+    /**
+     * 执行一条计划：对该 Provider 下每个已连接账号发送 → 按需刷新额度 →
+     * 推进这条计划（按 Provider 只推进一次）→ 通知。
+     */
+    private suspend fun executeRule(
+        rule: ScheduleRule,
+        accounts: List<Account>,
+        settings: Settings,
+        now: Long
+    ) {
+        // 重新读一次，UI 可能刚改过这条规则 / 增删过账号
         val current = Store.rules.value.firstOrNull { it.id == rule.id } ?: return
         if (!current.enabled) return
         if (!BackgroundMath.isRuleDue(current, now, current.nextRunAt)) return
 
         val provider = current.provider
-        if (!Store.account(provider).linked) return
+        val targets = AccountSupport.linkedFor(provider)
+        if (targets.isEmpty()) return
         val message = current.message.ifBlank { DefaultMessages.forProvider(provider) }
 
-        val result = SendEngine.send(this, provider, message)
-        val doneAt = System.currentTimeMillis()
-
-        // 规则要求同步额度时先刷新：拿到新的窗口重置时刻，FOLLOW_RESET 的下次锚点才准
-        if (result.ok && current.syncQuota) {
-            SendEngine.refresh(this, provider, record = true)
-            lastRefreshAt = System.currentTimeMillis()
+        var okCount = 0
+        var lastDetail = ""
+        for (account in targets) {
+            val result = SendEngine.send(this, account, message)
+            if (result.ok) {
+                okCount++
+                // 规则要求同步额度时刷新该账号（拿到新的窗口重置时刻）
+                if (current.syncQuota) {
+                    SendEngine.refresh(this, account, record = true)
+                    lastRefreshAt = System.currentTimeMillis()
+                }
+            } else {
+                lastDetail = result.detail
+            }
+            onSendResult(account, message, result, settings)
         }
 
         // 推进计划：无论成功失败都重排，避免失败后每 30 秒重试轰炸
-        val label = if (result.ok) "成功" else "失败：${result.detail}"
+        val doneAt = System.currentTimeMillis()
+        val window = settings.windowMillis()
+        val label = when {
+            okCount == targets.size -> "成功"
+            okCount > 0 -> "成功 $okCount/${targets.size}"
+            else -> "失败：$lastDetail"
+        }
         Store.updateRule(current.id) { latest ->
             val ran = latest.copy(lastRunAt = doneAt, lastResult = label)
             ran.copy(
                 nextRunAt = ScheduleMath.computeNext(
                     ran,
                     doneAt,
-                    Store.quota(provider).officialResetAt,
-                    settings.windowMillis()
+                    AccountSupport.nextResetAt(provider, doneAt, window),
+                    window
                 )
             )
         }
 
-        onSendResult(provider, message, result, settings)
         updateOngoingNotification(force = true)
         AlarmScheduler.scheduleNext(this)
     }
 
-    /** 按 `autoRefreshMinutes` 定期刷新官方额度。 */
+    /** 按 `autoRefreshMinutes` 定期刷新所有已连接账号的官方额度。 */
     private suspend fun maybeAutoRefresh(now: Long, settings: Settings) {
         val interval = settings.refreshMillis()
         if (interval <= 0L) return // 0 = 只手动刷新
@@ -358,10 +374,10 @@ class KeepAliveService : Service() {
         }
         if (now - lastRefreshAt < interval) return
         lastRefreshAt = now
-        val targets = Store.accounts.value.values.filter { it.linked }.map { it.provider }
+        val targets = AccountSupport.linked()
         if (targets.isEmpty()) return
-        targets.forEach { provider ->
-            runCatching { SendEngine.refresh(this, provider, record = true) }
+        targets.forEach { account ->
+            runCatching { SendEngine.refresh(this, account, record = true) }
         }
     }
 
@@ -371,8 +387,11 @@ class KeepAliveService : Service() {
     private suspend fun sendNow(provider: ProviderId?) {
         try {
             operationMutex.withLock {
-                val targets = provider?.let { listOf(it) }
-                    ?: ProviderId.ordered.filter { Store.account(it).linked }
+                val targets = if (provider == null) {
+                    AccountSupport.linked()
+                } else {
+                    AccountSupport.linkedFor(provider)
+                }
                 if (targets.isEmpty()) {
                     NotificationHelper.notifyNotice(
                         this,
@@ -383,7 +402,43 @@ class KeepAliveService : Service() {
                     return@withLock
                 }
                 val settings = Store.settingsNow()
-                coroutineSendTargets(targets, settings)
+                val touchedProviders = linkedSetOf<ProviderId>()
+                val successfulProviders = linkedSetOf<ProviderId>()
+
+                for (account in targets) {
+                    val p = account.provider
+                    val rule = Store.rules.value.firstOrNull { it.provider == p }
+                    val message = rule?.message?.takeIf { it.isNotBlank() }
+                        ?: DefaultMessages.forProvider(p)
+                    val result = SendEngine.send(this, account, message)
+                    touchedProviders.add(p)
+                    if (result.ok) {
+                        successfulProviders.add(p)
+                        if (rule?.syncQuota == true) {
+                            SendEngine.refresh(this, account, record = true)
+                        }
+                    }
+                    onSendResult(account, message, result, settings)
+                }
+
+                // 手动续命已经把窗口续上：把该 Provider 计划的锚点推到下一次，避免紧接着又自动发
+                val doneAt = System.currentTimeMillis()
+                val window = settings.windowMillis()
+                for (p in touchedProviders) {
+                    if (p !in successfulProviders) continue
+                    val rule = Store.rules.value.firstOrNull { it.provider == p } ?: continue
+                    Store.updateRule(rule.id) { latest ->
+                        val ran = latest.copy(lastRunAt = doneAt, lastResult = "成功（手动）")
+                        ran.copy(
+                            nextRunAt = ScheduleMath.computeNext(
+                                ran,
+                                doneAt,
+                                AccountSupport.nextResetAt(p, doneAt, window),
+                                window
+                            )
+                        )
+                    }
+                }
             }
         } catch (t: Throwable) {
             Log.w(TAG, "手动发送失败：${t.message}")
@@ -392,49 +447,20 @@ class KeepAliveService : Service() {
         AlarmScheduler.scheduleNext(this)
     }
 
-    private suspend fun coroutineSendTargets(targets: List<ProviderId>, settings: Settings) {
-        for (provider in targets) {
-            if (!Store.account(provider).linked) continue
-            val rule = Store.rules.value.firstOrNull { it.provider == provider }
-            val message = rule?.message?.takeIf { it.isNotBlank() }
-                ?: DefaultMessages.forProvider(provider)
-            val result = SendEngine.send(this, provider, message)
-            if (result.ok && rule?.syncQuota == true) {
-                SendEngine.refresh(this, provider, record = true)
-            }
-            onSendResult(provider, message, result, settings)
-            if (result.ok) {
-                // 手动续命已经把窗口续上，顺手把计划的锚点推到下一次，避免紧接着又自动发
-                val doneAt = System.currentTimeMillis()
-                rule?.let { r ->
-                    Store.updateRule(r.id) { latest ->
-                        val ran = latest.copy(lastRunAt = doneAt, lastResult = "成功（手动）")
-                        ran.copy(
-                            nextRunAt = ScheduleMath.computeNext(
-                                ran,
-                                doneAt,
-                                Store.quota(provider).officialResetAt,
-                                settings.windowMillis()
-                            )
-                        )
-                    }
-                }
-            }
-        }
-    }
-
     /** 立即刷新额度：provider 为 null 时刷新所有已连接账号。 */
     private suspend fun refreshQuota(provider: ProviderId?) {
         try {
             operationMutex.withLock {
-                val targets = provider?.let { listOf(it) }
-                    ?: ProviderId.ordered.filter { Store.account(it).linked }
-                targets.forEach { target ->
-                    if (!Store.account(target).linked) return@forEach
-                    val result = SendEngine.refresh(this, target, record = true)
-                    // 手动刷新失败给可见反馈；自动刷新只写时间线
+                val targets = if (provider == null) {
+                    AccountSupport.linked()
+                } else {
+                    AccountSupport.linkedFor(provider)
+                }
+                targets.forEach { account ->
+                    val result = SendEngine.refresh(this, account, record = true)
+                    // 手动刷新失败给可见反馈（按账号分别提示）；自动刷新只写时间线
                     if (!result.ok) {
-                        NotificationHelper.notifyRefreshFailure(this, target, result.detail)
+                        NotificationHelper.notifyRefreshFailure(this, account, result.detail)
                     }
                 }
                 lastRefreshAt = System.currentTimeMillis()
@@ -447,34 +473,34 @@ class KeepAliveService : Service() {
 
     // ------------------------------------------------------------ 结果处理
 
-    /** 发送结果通知策略：成功按设置提醒；失败连续 3 次才提醒，未授权额外限流提醒。 */
+    /** 发送结果通知策略：成功按设置提醒；失败连续 3 次才提醒，未授权额外限流提醒。按账号隔离。 */
     private fun onSendResult(
-        provider: ProviderId,
+        account: Account,
         message: String,
         result: SendEngine.Result,
         settings: Settings
     ) {
         val now = System.currentTimeMillis()
         if (result.ok) {
-            failureStreak.remove(provider)
+            failureStreak.remove(account.id)
             if (settings.resultNotification) {
                 NotificationHelper.notifySendResult(
                     this,
-                    provider,
+                    account,
                     ok = true,
-                    detail = "${provider.label} 已发送「$message」"
+                    detail = "${AccountSupport.title(account)} 已发送「$message」"
                 )
             }
             return
         }
 
-        val count = (failureStreak[provider] ?: 0) + 1
-        failureStreak[provider] = count
-        val lastAlert = lastFailureAlertAt[provider] ?: 0L
+        val count = (failureStreak[account.id] ?: 0) + 1
+        failureStreak[account.id] = count
+        val lastAlert = lastFailureAlertAt[account.id] ?: 0L
         val unauthorizedAlert = result.unauthorized && now - lastAlert > UNAUTHORIZED_ALERT_GAP_MILLIS
         if (BackgroundMath.shouldAlertFailure(count) || unauthorizedAlert) {
-            lastFailureAlertAt[provider] = now
-            NotificationHelper.notifyFailureAlert(this, provider, count, result.detail)
+            lastFailureAlertAt[account.id] = now
+            NotificationHelper.notifyFailureAlert(this, account, count, result.detail)
         }
     }
 

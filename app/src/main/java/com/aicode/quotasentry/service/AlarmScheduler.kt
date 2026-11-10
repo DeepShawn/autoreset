@@ -57,6 +57,7 @@ object AlarmScheduler {
             return
         }
         val window = settings.windowMillis()
+        // 计划仍然按 Provider 调度；多账号时取该 Provider 下最早的官方重置时刻做锚点
         val candidates = Store.rules.value
             .filter { it.enabled }
             .map { rule ->
@@ -66,7 +67,7 @@ object AlarmScheduler {
                     ScheduleMath.computeNext(
                         rule,
                         now,
-                        Store.quota(rule.provider).officialResetAt,
+                        AccountSupport.nextResetAt(rule.provider, now, window),
                         window
                     )
                 }

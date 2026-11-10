@@ -80,7 +80,7 @@ import kotlin.math.roundToInt
  * 所有改动立即写 [Store]，后台服务下一次 tick 生效；开关类操作直接走 [ServiceController]。
  */
 @Composable
-fun SettingsScreen(now: Long, onOpenAccount: (ProviderId) -> Unit) {
+fun SettingsScreen(now: Long, onOpenAccount: (String) -> Unit) {
     val p = QsTheme.palette
     val context = LocalContext.current
     val accounts by Store.accounts.collectAsState()
@@ -133,48 +133,78 @@ fun SettingsScreen(now: Long, onOpenAccount: (ProviderId) -> Unit) {
             StaggerItem(1) {
                 Spacer(Modifier.height(16.dp))
                 SectionCard(title = "账号连接") {
-                    ProviderId.ordered.forEachIndexed { index, provider ->
-                        val account = accounts[provider]
-                        val linked = account?.linked == true
+                    var rowIndex = 0
+                    val totalRows = accounts.size + ProviderId.ordered.size
+                    ProviderId.ordered.forEach { provider ->
+                        val group = accounts.filter { it.provider == provider }.sortedBy { it.linkedAt }
+                        group.forEachIndexed { index, account ->
+                            val linked = account.linked
+                            ListRow(
+                                title = account.displayName(index),
+                                subtitle = when {
+                                    !linked -> "未连接 · 粘贴 Cookie 或 Chrome 授权登录"
+                                    account.label.isNotBlank() && account.plan.isNotBlank() ->
+                                        "已连接 · ${account.plan} · ${account.label}"
+                                    account.plan.isNotBlank() -> "已连接 · ${account.plan}"
+                                    else -> "已连接"
+                                },
+                                leading = {
+                                    Box(
+                                        Modifier
+                                            .size(QsDims.leadingIcon)
+                                            .clip(CircleShape)
+                                            .background(p.text.copy(alpha = 0.06f)),
+                                        contentAlignment = Alignment.Center
+                                    ) {
+                                        ProviderLogo(provider = provider, size = 24.dp)
+                                    }
+                                },
+                                trailing = {
+                                    Row(verticalAlignment = Alignment.CenterVertically) {
+                                        StatusDot(
+                                            color = if (linked) p.ok else p.faint,
+                                            size = 7.dp,
+                                            halo = linked
+                                        )
+                                        Spacer(Modifier.width(8.dp))
+                                        MText(
+                                            text = if (linked) "已连接" else "去连接",
+                                            color = if (linked) p.dim else p.accentInk,
+                                            style = QsType.tiny,
+                                            maxLines = 1
+                                        )
+                                    }
+                                },
+                                showChevron = true,
+                                divider = true,
+                                onClick = { onOpenAccount(account.id) }
+                            )
+                            rowIndex += 1
+                        }
+                        // 每个服务都提供「添加账号」入口（同一服务可连多个账户）。
                         ListRow(
-                            title = provider.label,
-                            subtitle = when {
-                                !linked -> "未连接 · 粘贴 Cookie 或 Chrome 授权登录"
-                                account.plan.isNotBlank() -> "已连接 · ${account.plan}" +
-                                    if (account.label.isNotBlank()) " · ${account.label}" else ""
-                                else -> "已连接"
+                            title = "添加 ${provider.shortLabel} 账号",
+                            subtitle = if (group.isEmpty()) {
+                                "还没有账号槽位"
+                            } else {
+                                "当前 ${group.size} 个账号 · 可再添加一个"
                             },
-                            leading = {
-                                Box(
-                                    Modifier
-                                        .size(QsDims.leadingIcon)
-                                        .clip(CircleShape)
-                                        .background(p.text.copy(alpha = 0.06f)),
-                                    contentAlignment = Alignment.Center
-                                ) {
-                                    ProviderLogo(provider = provider, size = 24.dp)
-                                }
-                            },
+                            leadingIcon = QsIcon.PLUS,
                             trailing = {
-                                Row(verticalAlignment = Alignment.CenterVertically) {
-                                    StatusDot(
-                                        color = if (linked) p.ok else p.faint,
-                                        size = 7.dp,
-                                        halo = linked
-                                    )
-                                    Spacer(Modifier.width(8.dp))
-                                    MText(
-                                        text = if (linked) "已连接" else "去连接",
-                                        color = if (linked) p.dim else p.accentInk,
-                                        style = QsType.tiny,
-                                        maxLines = 1
-                                    )
-                                }
+                                MText(
+                                    text = "添加",
+                                    color = p.accentInk,
+                                    style = QsType.tiny,
+                                    maxLines = 1
+                                )
                             },
-                            showChevron = true,
-                            divider = index != ProviderId.ordered.lastIndex,
-                            onClick = { onOpenAccount(provider) }
+                            divider = rowIndex != totalRows - 1,
+                            onClick = {
+                                val created = Store.addAccount(provider)
+                                onOpenAccount(created.id)
+                            }
                         )
+                        rowIndex += 1
                     }
                 }
             }

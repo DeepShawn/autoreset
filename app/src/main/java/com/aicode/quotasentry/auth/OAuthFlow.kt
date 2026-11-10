@@ -80,6 +80,7 @@ object OAuthFlow {
     private val random = SecureRandom()
 
     @Volatile private var pendingProvider: ProviderId? = null
+    @Volatile private var pendingAccountId: String = ""
     @Volatile private var pendingVerifier: String = ""
     @Volatile private var pendingChallenge: String = ""
     @Volatile private var pendingState: String = ""
@@ -90,7 +91,7 @@ object OAuthFlow {
     val supported: Set<ProviderId> = setOf(ProviderId.CLAUDE, ProviderId.CHATGPT)
 
     /** 打开 Chrome 开始授权；只支持 Claude / ChatGPT。 */
-    fun launch(context: Context, provider: ProviderId) {
+    fun launch(context: Context, provider: ProviderId, accountId: String = "") {
         if (provider !in supported) {
             _state.value = OAuthState.Error(provider, "该服务没有可用的 OAuth 额度接口，请用 Cookie 连接")
             return
@@ -98,6 +99,7 @@ object OAuthFlow {
         cancel()
         val pkce = generatePkce()
         pendingProvider = provider
+        pendingAccountId = accountId
         pendingVerifier = pkce.verifier
         pendingChallenge = pkce.challenge
         pendingState = randomToken(16)
@@ -163,6 +165,7 @@ object OAuthFlow {
         runCatching { flowJob?.cancel() }
         flowJob = null
         pendingProvider = null
+        pendingAccountId = ""
         pendingVerifier = ""
         pendingChallenge = ""
         pendingState = ""
@@ -175,6 +178,7 @@ object OAuthFlow {
         if (_state.value is OAuthState.Success || _state.value is OAuthState.Error) {
             _state.value = OAuthState.Idle
             pendingProvider = null
+            pendingAccountId = ""
         }
     }
 
@@ -426,17 +430,31 @@ object OAuthFlow {
             if (token.expiresIn > 0) put("oauthExpiresAt", (now + token.expiresIn * 1000L).toString())
             if (token.accountId.isNotBlank()) put("accountId", token.accountId)
         }
-        Store.updateAccount(provider) { account ->
-            account.copy(
-                credentials = account.credentials.copy(
-                    accessToken = token.accessToken,
-                    extra = account.credentials.extra + extra
-                ),
-                linked = true,
-                lastError = ""
-            )
+        val accountId = pendingAccountId
+        if (accountId.isNotBlank()) {
+            Store.updateAccountById(accountId) { account ->
+                account.copy(
+                    credentials = account.credentials.copy(
+                        accessToken = token.accessToken,
+                        extra = account.credentials.extra + extra
+                    ),
+                    linked = true,
+                    lastError = ""
+                )
+            }
+        } else {
+            Store.updateAccount(provider) { account ->
+                account.copy(
+                    credentials = account.credentials.copy(
+                        accessToken = token.accessToken,
+                        extra = account.credentials.extra + extra
+                    ),
+                    linked = true,
+                    lastError = ""
+                )
+            }
         }
-        val account = Store.account(provider)
+        val account = if (accountId.isNotBlank()) Store.accountById(accountId) ?: Store.account(provider) else Store.account(provider)
         _state.value = OAuthState.Exchanging(provider)
         when (val result = runCatching { Providers.of(provider).connect(account, Store.settingsNow()) }.getOrNull()) {
             is ConnectResult.Ok -> {
@@ -461,6 +479,7 @@ object OAuthFlow {
             null -> _state.value = OAuthState.Success(provider, "")
         }
         pendingProvider = null
+        pendingAccountId = ""
     }
 
     // ------------------------------------------------------------------ 工具

@@ -32,6 +32,8 @@ data class Credentials(
 }
 
 data class Account(
+    /** 稳定 id：同一 Provider 可以连接多个账号，额度/凭据/发送记录都按 id 存 */
+    val id: String = java.util.UUID.randomUUID().toString(),
     val provider: ProviderId,
     val credentials: Credentials = Credentials(),
     val linked: Boolean = false,
@@ -45,6 +47,13 @@ data class Account(
 ) {
     companion object {
         fun empty(provider: ProviderId) = Account(provider = provider)
+    }
+
+    /** 给 UI 显示的可读名字：邮箱 > 自定义标签 > “Claude 2” */
+    fun displayName(index: Int = 0): String = when {
+        label.isNotBlank() -> label
+        plan.isNotBlank() -> provider.shortLabel + " · " + plan
+        else -> if (index > 0) provider.shortLabel + " " + (index + 1) else provider.label
     }
 }
 

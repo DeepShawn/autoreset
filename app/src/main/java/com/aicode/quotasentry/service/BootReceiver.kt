@@ -22,7 +22,7 @@ class BootReceiver : BroadcastReceiver() {
             AlarmScheduler.cancel(app)
             return
         }
-        val hasLinked = Store.accounts.value.values.any { it.linked }
+        val hasLinked = Store.linkedAccounts().isNotEmpty()
         if (!hasLinked) {
             AlarmScheduler.cancel(app)
             return

@@ -78,7 +78,10 @@ object ServiceBridgeImpl : ServiceBridge {
                         ?.message
                         ?.takeIf { it.isNotBlank() }
                         ?: DefaultMessages.forProvider(provider)
-                    SendEngine.send(app, provider, message)
+                    // 多账号：该 Provider 下每个已连接账号都要发
+                    Store.linkedAccounts()
+                        .filter { it.provider == provider }
+                        .forEach { account -> SendEngine.send(app, account, message) }
                 }
             }
         }
@@ -90,9 +93,12 @@ object ServiceBridgeImpl : ServiceBridge {
         if (!started) {
             fallbackScope.launch {
                 runCatching {
-                    val targets = provider?.let { listOf(it) }
-                        ?: ProviderId.ordered.filter { Store.account(it).linked }
-                    targets.forEach { SendEngine.refresh(app, it, record = true) }
+                    val targets = if (provider == null) {
+                        Store.linkedAccounts()
+                    } else {
+                        Store.linkedAccounts().filter { it.provider == provider }
+                    }
+                    targets.forEach { account -> SendEngine.refresh(app, account, record = true) }
                 }
             }
         }

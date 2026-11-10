@@ -27,6 +27,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import com.aicode.quotasentry.core.Account
 import com.aicode.quotasentry.core.ConnectResult
+import com.aicode.quotasentry.core.Credentials
 import com.aicode.quotasentry.core.EventKind
 import com.aicode.quotasentry.core.Formatters
 import com.aicode.quotasentry.core.ProviderId
@@ -108,13 +109,18 @@ fun Context.findActivityOrNull(): Activity? {
     return null
 }
 
-/** 账号相关的写操作：连接、保存 Cookie、断开，全部集中在这里，页面只调用。 */
+/** 账号相关的写操作：连接、保存凭据、断开、删除，全部按账号 id 操作，页面只调用。 */
 object AccountFlow {
 
-    /** 把 Cookie 写进 Store（从剪贴板粘贴 Cookie 后调用）。 */
-    fun saveCookie(provider: ProviderId, cookie: String) {
-        Store.updateAccount(provider) { account ->
-            account.copy(credentials = account.credentials.copy(cookie = cookie.trim()))
+    /** 保存 Cookie / accessToken 到指定账号（从剪贴板粘贴或手动输入后调用）。 */
+    fun saveCredentials(accountId: String, cookie: String, accessToken: String) {
+        Store.updateAccountById(accountId) { account ->
+            account.copy(
+                credentials = account.credentials.copy(
+                    cookie = cookie.trim(),
+                    accessToken = accessToken.trim()
+                )
+            )
         }
     }
 
@@ -122,8 +128,10 @@ object AccountFlow {
      * 调用 ProviderClient.connect 验证账号，并把结果写回 Store。
      * 网络/解析异常一律转成中文失败结果，不向上抛。
      */
-    suspend fun verify(provider: ProviderId): ConnectResult = withContext(Dispatchers.IO) {
-        val account = Store.account(provider)
+    suspend fun verify(accountId: String): ConnectResult = withContext(Dispatchers.IO) {
+        val account = Store.accountById(accountId)
+            ?: return@withContext ConnectResult.Fail("账号不存在，请重新打开账号面板")
+        val provider = account.provider
         val settings = Store.settingsNow()
         val result: ConnectResult = try {
             if (!Providers.has(provider)) {
@@ -137,7 +145,7 @@ object AccountFlow {
         val now = System.currentTimeMillis()
         when (result) {
             is ConnectResult.Ok -> {
-                Store.updateAccount(provider) { current ->
+                Store.updateAccountById(accountId) { current ->
                     current.copy(
                         linked = true,
                         plan = result.plan.ifBlank { current.plan },
@@ -149,12 +157,15 @@ object AccountFlow {
                 }
                 val patch = result.quota
                 if (patch != null) {
-                    Store.updateQuota(provider) { quota -> com.aicode.quotasentry.core.QuotaMath.applyPatch(quota, patch, now) }
+                    Store.updateQuotaById(accountId) { quota ->
+                        com.aicode.quotasentry.core.QuotaMath.applyPatch(quota, patch, now)
+                    }
                 }
+                val name = Store.accountById(accountId)?.let { accountDisplayName(it, Store.allAccounts()) } ?: provider.label
                 Store.record(
                     provider = provider,
                     ok = true,
-                    text = "账号连接成功",
+                    text = "$name 连接成功",
                     detail = result.plan.ifBlank { "已验证凭据" },
                     kind = EventKind.LINK,
                     at = now
@@ -162,7 +173,7 @@ object AccountFlow {
             }
 
             is ConnectResult.Fail -> {
-                Store.updateAccount(provider) { current ->
+                Store.updateAccountById(accountId) { current ->
                     current.copy(linked = false, lastError = result.message)
                 }
                 Store.record(
@@ -178,10 +189,21 @@ object AccountFlow {
         result
     }
 
-    /** 断开连接：清空凭据，避免留着失效 Cookie。 */
-    fun disconnect(provider: ProviderId) {
-        Store.setAccount(Account.empty(provider))
-        Store.updateQuota(provider) { quota ->
+    /** 断开连接：清空凭据但保留账号槽位，方便随时重新连接。 */
+    fun disconnect(accountId: String) {
+        val account = Store.accountById(accountId) ?: return
+        Store.updateAccountById(accountId) { current ->
+            current.copy(
+                linked = false,
+                credentials = Credentials(),
+                plan = "",
+                label = "",
+                lastError = "",
+                linkedAt = 0L,
+                lastVerifiedAt = 0L
+            )
+        }
+        Store.updateQuotaById(accountId) { quota ->
             quota.copy(
                 officialUsedFraction = null,
                 officialResetAt = null,
@@ -191,7 +213,14 @@ object AccountFlow {
                 localWindowStart = 0L
             )
         }
-        Store.record(provider, true, "已断开连接", "", EventKind.LINK)
+        Store.record(account.provider, true, "已断开账号", account.displayName(), EventKind.LINK)
+    }
+
+    /** 删除账号槽位（同一 Provider 的最后一个槽位建议保留，UI 会禁用删除）。 */
+    fun remove(accountId: String) {
+        val account = Store.accountById(accountId) ?: return
+        Store.removeAccount(accountId)
+        Store.record(account.provider, true, "已删除账号", account.displayName(), EventKind.LINK)
     }
 }
 
@@ -203,23 +232,45 @@ object AccountFlow {
 fun computeNextRun(rule: ScheduleRule, quota: QuotaState?, windowMillis: Long, now: Long): Long =
     ScheduleMath.computeNext(rule, now, quota?.officialResetAt, windowMillis)
 
+/** 该 Provider 第一个已连接账号的额度（计划是每个 Provider 一条，预览用）。 */
+fun firstAccountQuota(
+    provider: ProviderId,
+    accounts: List<Account>,
+    quotas: Map<String, QuotaState>
+): QuotaState? {
+    val first = accounts.firstOrNull { it.provider == provider && it.linked }
+        ?: accounts.firstOrNull { it.provider == provider }
+    return first?.let { quotas[it.id] }
+}
+
 /** 计划卡片上的一行“下次 …”。 */
 fun nextRunText(rule: ScheduleRule, next: Long, now: Long): String =
     ScheduleMath.describeNext(rule, next, now)
 
 /** 已连接账号数量。 */
-fun connectedCount(accounts: Map<ProviderId, Account>): Int = accounts.values.count { it.linked }
+fun connectedCount(accounts: List<Account>): Int = accounts.count { it.linked }
 
 /** 最早连接时间，用于“已运行 X”的展示。 */
-fun runningSince(accounts: Map<ProviderId, Account>): Long =
-    accounts.values.filter { it.linked }.mapNotNull { it.linkedAt.takeIf { v -> v > 0L } }.minOrNull() ?: 0L
+fun runningSince(accounts: List<Account>): Long =
+    accounts.filter { it.linked }.mapNotNull { it.linkedAt.takeIf { v -> v > 0L } }.minOrNull() ?: 0L
 
-/** 首页顶部胶囊文案。 */
-fun guardianStatusText(running: Boolean, accounts: Map<ProviderId, Account>, now: Long): String {
+/** 首页顶部胶囊文案（按账号数而不是 provider 数）。 */
+fun guardianStatusText(running: Boolean, accounts: List<Account>, now: Long): String {
     if (!running) return "未启动 · 点击开启"
     val since = runningSince(accounts)
     return if (since > 0L && now > since) "守护中 · 已运行 " + Formatters.humanDuration(now - since)
     else "守护中 · 等待连接"
+}
+
+/**
+ * 账号在「同一 Provider 下的序号」里的人类可读名：
+ * 有 label（邮箱）用邮箱；有 plan 用 “Claude · Pro”；否则第二个起显示 “Claude 2”。
+ */
+fun accountDisplayName(account: Account, all: List<Account>): String {
+    // 与首页卡片顺序保持一致：同 Provider 按连接时间排序，序号才稳定。
+    val siblings = all.filter { it.provider == account.provider }.sortedBy { it.linkedAt }
+    val index = siblings.indexOfFirst { it.id == account.id }.coerceAtLeast(0)
+    return account.displayName(index)
 }
 
 /** 账号状态说明。 */
