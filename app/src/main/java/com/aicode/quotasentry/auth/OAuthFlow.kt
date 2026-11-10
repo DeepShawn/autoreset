@@ -55,20 +55,23 @@ sealed interface OAuthState {
 object OAuthFlow {
 
     private const val CLAUDE_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
-    private const val CLAUDE_SCOPES = "org:create_api_key user:profile user:inference"
+    private const val CLAUDE_SCOPES =
+        "org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers"
     private const val CLAUDE_AUTHORIZE = "https://claude.ai/oauth/authorize"
-    private const val CLAUDE_REDIRECT = "https://console.anthropic.com/oauth/code/callback"
+    private const val CLAUDE_REDIRECT = "https://platform.claude.com/oauth/code/callback"
     private val CLAUDE_TOKEN_URLS = listOf(
         "https://console.anthropic.com/v1/oauth/token",
         "https://platform.claude.com/v1/oauth/token"
     )
 
     private const val OPENAI_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
-    private const val OPENAI_SCOPES = "openid profile email offline_access"
+    private const val OPENAI_SCOPES =
+        "openid profile email offline_access api.connectors.read api.connectors.invoke"
     private const val OPENAI_AUTHORIZE = "https://auth.openai.com/oauth/authorize"
     private const val OPENAI_TOKEN = "https://auth.openai.com/oauth/token"
-    private const val OPENAI_REDIRECT = "http://localhost:1455/auth/callback"
+    private const val OPENAI_ORIGINATOR = "codex_cli_rs"
     private const val OPENAI_PORT = 1455
+    private const val OPENAI_PORT_FALLBACK = 1457
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val _state = MutableStateFlow<OAuthState>(OAuthState.Idle)
@@ -80,6 +83,7 @@ object OAuthFlow {
     @Volatile private var pendingVerifier: String = ""
     @Volatile private var pendingChallenge: String = ""
     @Volatile private var pendingState: String = ""
+    @Volatile private var pendingRedirect: String = ""
     @Volatile private var loopback: ServerSocket? = null
     private var flowJob: Job? = null
 
@@ -98,8 +102,27 @@ object OAuthFlow {
         pendingChallenge = pkce.challenge
         pendingState = randomToken(16)
         val authUrl = when (provider) {
-            ProviderId.CLAUDE -> buildClaudeAuthorizeUrl(pkce.challenge, pendingState)
-            ProviderId.CHATGPT -> buildOpenAiAuthorizeUrl(pkce.challenge, pendingState)
+            ProviderId.CLAUDE -> {
+                pendingRedirect = CLAUDE_REDIRECT
+                buildClaudeAuthorizeUrl(pkce.challenge, pendingState)
+            }
+
+            ProviderId.CHATGPT -> {
+                // Codex CLI 的 redirect 是 127.0.0.1:1455/1457，必须在授权 URL 里用实际绑定端口，
+                // 否则 Chrome 回调会连到没人监听的地址。
+                val port = bindLoopback()
+                if (port == null) {
+                    _state.value = OAuthState.Error(
+                        provider,
+                        "本地回调端口 1455 / 1457 都被占用，请关闭占用端口的程序后重试"
+                    )
+                    pendingProvider = null
+                    return
+                }
+                pendingRedirect = "http://127.0.0.1:$port/auth/callback"
+                buildOpenAiAuthorizeUrl(pkce.challenge, pendingState, pendingRedirect)
+            }
+
             else -> return
         }
         _state.value = OAuthState.Waiting(
@@ -112,7 +135,7 @@ object OAuthFlow {
             }
         )
         if (provider == ProviderId.CHATGPT) {
-            startLoopback(provider)
+            acceptLoop(provider)
         }
         openInChrome(context, authUrl)
     }
@@ -142,6 +165,7 @@ object OAuthFlow {
         pendingVerifier = ""
         pendingChallenge = ""
         pendingState = ""
+        pendingRedirect = ""
         _state.value = OAuthState.Idle
     }
 
@@ -169,17 +193,18 @@ object OAuthFlow {
         return CLAUDE_AUTHORIZE + "?" + encodeQuery(params)
     }
 
-    fun buildOpenAiAuthorizeUrl(challenge: String, state: String): String {
+    fun buildOpenAiAuthorizeUrl(challenge: String, state: String, redirectUri: String): String {
         val params = linkedMapOf(
             "response_type" to "code",
             "client_id" to OPENAI_CLIENT_ID,
-            "redirect_uri" to OPENAI_REDIRECT,
+            "redirect_uri" to redirectUri,
             "scope" to OPENAI_SCOPES,
             "code_challenge" to challenge,
             "code_challenge_method" to "S256",
             "state" to state,
             "id_token_add_organizations" to "true",
-            "codex_cli_simplified_flow" to "true"
+            "codex_cli_simplified_flow" to "true",
+            "originator" to OPENAI_ORIGINATOR
         )
         return OPENAI_AUTHORIZE + "?" + encodeQuery(params)
     }
@@ -213,63 +238,65 @@ object OAuthFlow {
 
     // ------------------------------------------------------------------ 回调 / 兑换
 
-    private fun startLoopback(provider: ProviderId) {
+    /** 绑定本地回调端口：优先 1455，其次 1457（Codex CLI 的 allow-list 端口）。 */
+    private fun bindLoopback(): Int? {
         stopLoopback()
-        flowJob = scope.launch {
+        for (port in intArrayOf(OPENAI_PORT, OPENAI_PORT_FALLBACK)) {
             val server = runCatching {
                 ServerSocket().apply {
                     reuseAddress = true
-                    bind(InetSocketAddress("127.0.0.1", OPENAI_PORT))
+                    bind(InetSocketAddress("127.0.0.1", port))
                     soTimeout = 180_000
                 }
-            }.getOrElse {
-                _state.value = OAuthState.Error(
-                    provider,
-                    "本地回调端口 1455 被占用，请关闭占用该端口的程序后重试"
-                )
-                return@launch
-            }
+            }.getOrNull() ?: continue
             loopback = server
+            return port
+        }
+        return null
+    }
+
+    private fun acceptLoop(provider: ProviderId) {
+        val server = loopback ?: return
+        flowJob = scope.launch {
             try {
-                server.use { s ->
-                    while (_state.value is OAuthState.Waiting) {
-                        val socket = runCatching { s.accept() }.getOrNull() ?: break
-                        runCatching {
-                            socket.use { client ->
-                                client.soTimeout = 10_000
-                                val reader = client.getInputStream().bufferedReader(Charsets.UTF_8)
-                                val requestLine = reader.readLine().orEmpty()
-                                val path = requestLine.split(' ').getOrNull(1).orEmpty()
-                                val redirectUri = Uri.parse("http://127.0.0.1$path")
-                                val query = redirectUri.getQueryParameter("code").orEmpty()
-                                val returnedState = redirectUri.getQueryParameter("state").orEmpty()
-                                val ok = query.isNotBlank() && (returnedState.isBlank() || returnedState == pendingState)
-                                val html = if (ok) {
-                                    "<html><meta charset='utf-8'><body style='background:#07090F;color:#57E6C0;font-family:sans-serif;" +
-                                        "display:flex;align-items:center;justify-content:center;height:100vh;margin:0'>" +
-                                        "<div style='text-align:center'><h2>授权成功</h2><p>请返回「额度哨兵」</p></div></body></html>"
-                                } else {
-                                    "<html><meta charset='utf-8'><body style='background:#07090F;color:#FF8AA8;font-family:sans-serif;" +
-                                        "display:flex;align-items:center;justify-content:center;height:100vh;margin:0'>" +
-                                        "<div style='text-align:center'><h2>授权失败</h2><p>请回到 App 重试</p></div></body></html>"
-                                }
-                                val bytes = html.toByteArray(Charsets.UTF_8)
-                                val header = "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n" +
-                                    "Content-Length: ${bytes.size}\r\nConnection: close\r\n\r\n"
-                                client.getOutputStream().write(header.toByteArray(Charsets.UTF_8))
-                                client.getOutputStream().write(bytes)
-                                client.getOutputStream().flush()
-                                if (ok) {
-                                    _state.value = OAuthState.Exchanging(provider)
-                                    stopLoopback()
-                                    exchangeOpenAiAndVerify(provider, query)
-                                }
+                while (_state.value is OAuthState.Waiting) {
+                    val socket = runCatching { server.accept() }.getOrNull() ?: break
+                    runCatching {
+                        socket.use { client ->
+                            client.soTimeout = 10_000
+                            val reader = client.getInputStream().bufferedReader(Charsets.UTF_8)
+                            val requestLine = reader.readLine().orEmpty()
+                            val path = requestLine.split(' ').getOrNull(1).orEmpty()
+                            val redirectUri = Uri.parse("http://127.0.0.1$path")
+                            val query = redirectUri.getQueryParameter("code").orEmpty()
+                            val returnedState = redirectUri.getQueryParameter("state").orEmpty()
+                            val ok = query.isNotBlank() &&
+                                (returnedState.isBlank() || returnedState == pendingState)
+                            val html = if (ok) {
+                                "<html><meta charset='utf-8'><body style='background:#07090F;color:#57E6C0;font-family:sans-serif;" +
+                                    "display:flex;align-items:center;justify-content:center;height:100vh;margin:0'>" +
+                                    "<div style='text-align:center'><h2>授权成功</h2><p>请返回「额度哨兵」</p></div></body></html>"
+                            } else {
+                                "<html><meta charset='utf-8'><body style='background:#07090F;color:#FF8AA8;font-family:sans-serif;" +
+                                    "display:flex;align-items:center;justify-content:center;height:100vh;margin:0'>" +
+                                    "<div style='text-align:center'><h2>授权失败</h2><p>请回到 App 重试</p></div></body></html>"
+                            }
+                            val bytes = html.toByteArray(Charsets.UTF_8)
+                            val header = "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n" +
+                                "Content-Length: ${bytes.size}\r\nConnection: close\r\n\r\n"
+                            client.getOutputStream().write(header.toByteArray(Charsets.UTF_8))
+                            client.getOutputStream().write(bytes)
+                            client.getOutputStream().flush()
+                            if (ok) {
+                                _state.value = OAuthState.Exchanging(provider)
+                                stopLoopback()
+                                exchangeOpenAiAndVerify(provider, query)
                             }
                         }
                     }
                 }
             } finally {
-                loopback = null
+                stopLoopback()
             }
         }
     }
@@ -349,7 +376,7 @@ object OAuthFlow {
             "grant_type" to "authorization_code",
             "client_id" to OPENAI_CLIENT_ID,
             "code" to code,
-            "redirect_uri" to OPENAI_REDIRECT,
+            "redirect_uri" to pendingRedirect,
             "code_verifier" to pendingVerifier
         )
         return when (val result = engine.postForm(OPENAI_TOKEN, fields = fields)) {

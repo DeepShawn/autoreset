@@ -12,7 +12,7 @@ class OAuthFlowTest {
         val url = OAuthFlow.buildClaudeAuthorizeUrl("CHALLENGE", "STATE123")
         assertTrue(url.startsWith("https://claude.ai/oauth/authorize?"))
         assertTrue(url.contains("client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e"))
-        assertTrue(url.contains("redirect_uri=https%3A%2F%2Fconsole.anthropic.com%2Foauth%2Fcode%2Fcallback"))
+        assertTrue(url.contains("redirect_uri=https%3A%2F%2Fplatform.claude.com%2Foauth%2Fcode%2Fcallback"))
         assertTrue(url.contains("code_challenge=CHALLENGE"))
         assertTrue(url.contains("code_challenge_method=S256"))
         assertTrue(url.contains("state=STATE123"))
@@ -21,12 +21,16 @@ class OAuthFlowTest {
 
     @Test
     fun `openai authorize url uses localhost loopback`() {
-        val url = OAuthFlow.buildOpenAiAuthorizeUrl("CHALLENGE", "STATE123")
+        val url = OAuthFlow.buildOpenAiAuthorizeUrl(
+            "CHALLENGE", "STATE123", "http://127.0.0.1:1455/auth/callback"
+        )
         assertTrue(url.startsWith("https://auth.openai.com/oauth/authorize?"))
         assertTrue(url.contains("client_id=app_EMoamEEZ73f0CkXaXp7hrann"))
-        assertTrue(url.contains("redirect_uri=http%3A%2F%2Flocalhost%3A1455%2Fauth%2Fcallback"))
+        assertTrue(url.contains("redirect_uri=http%3A%2F%2F127.0.0.1%3A1455%2Fauth%2Fcallback"))
         assertTrue(url.contains("code_challenge_method=S256"))
-        assertTrue(url.contains("scope=openid%20profile%20email%20offline_access"))
+        assertTrue(url.contains("scope=openid%20profile%20email%20offline_access%20api.connectors.read%20api.connectors.invoke"))
+        assertTrue(url.contains("originator=codex_cli_rs"))
+        assertTrue(url.contains("codex_cli_simplified_flow=true"))
     }
 
     @Test
