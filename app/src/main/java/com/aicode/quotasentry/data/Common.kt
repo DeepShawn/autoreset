@@ -148,6 +148,11 @@ internal object BrowserHeaders {
         if (!deviceId.isNullOrBlank()) put("anthropic-device-id", deviceId)
     }
 
+    /** 网页端会校验稳定的设备标识，缺失时更容易触发 403 人机验证。 */
+    private val chatGptDeviceId: String by lazy {
+        java.util.UUID.randomUUID().toString()
+    }
+
     fun chatGpt(cookie: String, accessToken: String?, accept: String = "application/json"): Map<String, String> = buildMap {
         if (cookie.isNotBlank()) put("Cookie", cookie)
         if (!accessToken.isNullOrBlank()) put("Authorization", "Bearer $accessToken")
@@ -157,6 +162,7 @@ internal object BrowserHeaders {
         put("Origin", "https://chatgpt.com")
         put("Referer", "https://chatgpt.com/")
         put("oai-language", "zh-CN")
+        put("oai-device-id", chatGptDeviceId)
     }
 
     fun gemini(cookie: String): Map<String, String> = buildMap {

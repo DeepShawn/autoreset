@@ -422,8 +422,9 @@ internal fun chatGptFailureText(code: Int, body: String): String {
             body.contains("sentinel", ignoreCase = true) ||
             body.contains("proof", ignoreCase = true)
         ) {
-            return "ChatGPT 触发了人机验证（403）：请换成 access token 方式，或在浏览器打开 " +
-                "chatgpt.com 正常对话一次后再重试"
+            return "ChatGPT 触发了人机验证（403）：多半是代理/VPN 的 IP 被 Cloudflare 风控。" +
+                "请换一个干净的节点，或在浏览器打开 chatgpt.com 正常对话一次后，重新粘贴**包含 cf_clearance 的完整 Cookie**" +
+                "（只有 accessToken 不够）" + if (detail.isNotBlank()) "。服务端：$detail" else ""
         }
         if (looksLikeHtml(body) || looksLikeCloudflareChallenge(body)) {
             return httpFailureText("ChatGPT", code, body)
