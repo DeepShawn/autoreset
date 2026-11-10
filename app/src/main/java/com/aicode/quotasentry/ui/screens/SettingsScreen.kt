@@ -165,7 +165,7 @@ fun SettingsScreen(now: Long, onOpenAccount: (ProviderId) -> Unit) {
                                     Spacer(Modifier.width(8.dp))
                                     MText(
                                         text = if (linked) "已连接" else "去连接",
-                                        color = if (linked) p.dim else p.accent,
+                                        color = if (linked) p.dim else p.accentInk,
                                         style = QsType.tiny,
                                         maxLines = 1
                                     )
@@ -420,7 +420,7 @@ fun SettingsScreen(now: Long, onOpenAccount: (ProviderId) -> Unit) {
                                 is UpdateState.Available -> GlassChip(text = "可更新", height = 26.dp)
                                 is UpdateState.Downloading -> MText(
                                     text = (s.progress.coerceAtLeast(0f) * 100).roundToInt().toString() + "%",
-                                    color = p.accent,
+                                    color = p.accentInk,
                                     style = QsType.tiny,
                                     maxLines = 1
                                 )
@@ -576,11 +576,12 @@ private fun StatusRow(
         title = title,
         subtitle = if (ok) okText else badText,
         leadingIcon = if (ok) QsIcon.CHECK else QsIcon.WARN,
+        leadingTint = if (ok) p.ok else p.warn,
         trailing = {
-            if (actionText != null) {
-                GlassChip(text = actionText, onClick = onAction, height = 30.dp)
+            if (ok) {
+                MText(text = "已开启", color = p.ok, style = QsType.footnote, maxLines = 1)
             } else {
-                MText(text = "已开启", color = p.ok, style = QsType.tiny, maxLines = 1)
+                GlassChip(text = actionText ?: "去处理", onClick = onAction, height = 30.dp)
             }
         },
         divider = divider
@@ -597,7 +598,7 @@ private fun MiuiStep(index: Int, title: String, detail: String) {
                 .background(p.accent.copy(alpha = 0.16f), CircleShape),
             contentAlignment = Alignment.Center
         ) {
-            MText(text = index.toString(), color = p.accent, style = QsType.tiny)
+            MText(text = index.toString(), color = p.accentInk, style = QsType.tiny)
         }
         Spacer(Modifier.width(10.dp))
         Column(Modifier.weight(1f)) {

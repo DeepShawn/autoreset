@@ -10,6 +10,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.compositeOver
+import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.TextStyle
@@ -44,9 +45,11 @@ data class QsPalette(
     val text: Color,
     val dim: Color,
     val faint: Color,
-    /** 强调色（来自 Settings.accent） */
+    /** 强调色（来自 Settings.accent），用于填充/描边/大色块 */
     val accent: Color,
     val accent2: Color,
+    /** 浅色主题下给文字/图标用的深色强调色（保证 ≥4.5:1 对比度） */
+    val accentInk: Color,
     val onAccent: Color,
     /** 语义色 */
     val danger: Color,
@@ -60,6 +63,8 @@ data class QsPalette(
     val strokeBottom: Color,
     /** 顶部内侧镜面高光 */
     val highlight: Color,
+    /** 内缩 1dp 的暗色内描边，表现玻璃厚度 */
+    val innerShade: Color,
     val shadow: Color,
     val divider: Color,
     /** BottomSheet / 悬浮层底色 */
@@ -80,21 +85,32 @@ data class QsPalette(
     fun strokeBrush(): Brush = Brush.linearGradient(listOf(strokeTop, strokeBottom))
 }
 
-/** 手写字级（无 Material 可用）。 */
+/** 手写字级（无 Material 可用）。中文一律 0 字距，数字统一 tnum 等宽。 */
 object QsType {
-    val hugeTitle = TextStyle(fontSize = 32.sp, fontWeight = FontWeight.Bold, letterSpacing = (-0.6).sp)
-    val largeTitle = TextStyle(fontSize = 28.sp, fontWeight = FontWeight.Bold, letterSpacing = (-0.4).sp)
-    val title = TextStyle(fontSize = 20.sp, fontWeight = FontWeight.SemiBold)
-    val cardTitle = TextStyle(fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
-    val body = TextStyle(fontSize = 14.sp)
-    val bodyMedium = TextStyle(fontSize = 14.sp, fontWeight = FontWeight.Medium)
-    val label = TextStyle(fontSize = 13.sp)
-    val caption = TextStyle(fontSize = 12.sp)
-    val tiny = TextStyle(fontSize = 11.sp, fontWeight = FontWeight.Medium)
-    val ringValue = TextStyle(fontSize = 22.sp, fontWeight = FontWeight.Bold, letterSpacing = (-0.5).sp)
-    val ringUnit = TextStyle(fontSize = 10.sp, fontWeight = FontWeight.Medium)
-    val mono = TextStyle(fontSize = 12.sp, fontFamily = FontFamily.Monospace)
-    val sectionTitle = TextStyle(fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+    val display = TextStyle(
+        fontSize = 34.sp, fontWeight = FontWeight.SemiBold, lineHeight = 40.sp,
+        fontFeatureSettings = "tnum", letterSpacing = (-0.2).sp
+    )
+    val hugeTitle = TextStyle(fontSize = 30.sp, fontWeight = FontWeight.SemiBold, lineHeight = 36.sp)
+    val largeTitle = TextStyle(fontSize = 28.sp, fontWeight = FontWeight.SemiBold, lineHeight = 34.sp)
+    val title = TextStyle(fontSize = 20.sp, fontWeight = FontWeight.SemiBold, lineHeight = 26.sp)
+    val headline = TextStyle(fontSize = 17.sp, fontWeight = FontWeight.Medium, lineHeight = 22.sp)
+    val cardTitle = TextStyle(fontSize = 16.sp, fontWeight = FontWeight.Medium, lineHeight = 21.sp)
+    val rowTitle = TextStyle(fontSize = 16.sp, fontWeight = FontWeight.Medium, lineHeight = 21.sp)
+    val body = TextStyle(fontSize = 15.sp, lineHeight = 22.sp)
+    val bodyMedium = TextStyle(fontSize = 15.sp, fontWeight = FontWeight.Medium, lineHeight = 22.sp)
+    val label = TextStyle(fontSize = 14.sp, lineHeight = 20.sp)
+    val caption = TextStyle(fontSize = 13.sp, lineHeight = 18.sp)
+    val footnote = TextStyle(fontSize = 12.sp, lineHeight = 16.sp)
+    val tiny = TextStyle(fontSize = 12.sp, fontWeight = FontWeight.Medium, lineHeight = 16.sp)
+    val micro = TextStyle(fontSize = 11.sp, fontWeight = FontWeight.Medium, lineHeight = 14.sp)
+    val ringValue = TextStyle(
+        fontSize = 22.sp, fontWeight = FontWeight.SemiBold, lineHeight = 26.sp,
+        fontFeatureSettings = "tnum", letterSpacing = (-0.3).sp
+    )
+    val ringUnit = TextStyle(fontSize = 11.sp, fontWeight = FontWeight.Medium, lineHeight = 14.sp)
+    val mono = TextStyle(fontSize = 12.sp, fontFamily = FontFamily.Monospace, lineHeight = 17.sp)
+    val sectionTitle = TextStyle(fontSize = 13.sp, fontWeight = FontWeight.SemiBold, lineHeight = 18.sp)
 }
 
 /** 主题兜底值（CompositionLocal 未提供时使用，保证单独预览也不崩）。 */
@@ -112,8 +128,26 @@ object QsTheme {
 fun accentColorOf(accent: AccentColor): Color = Color(accent.argb)
 
 private fun secondAccent(accent: Color): Color {
-    // 第二强调色取「强调色偏向天青」的混合色，让渐变有方向感但保持同一色系。
-    return lerp(accent, Color(0xFF7FB4FF), 0.55f)
+    // HSV 色相 +28°、饱和度 ×0.9：保持同一色系，不把琥珀/玫瑰混成灰。
+    val hsv = FloatArray(3)
+    android.graphics.Color.colorToHSV(accent.toArgb(), hsv)
+    hsv[0] = (hsv[0] + 28f) % 360f
+    hsv[1] = (hsv[1] * 0.9f).coerceIn(0f, 1f)
+    hsv[2] = (hsv[2] * 0.98f).coerceIn(0f, 1f)
+    return Color(android.graphics.Color.HSVToColor(hsv))
+}
+
+/** 浅色主题里给文字/图标用的强调色；都是和浅底 ≥4.5:1 的深色版本。 */
+private fun accentInkOf(accent: Color, dark: Boolean): Color {
+    if (dark) return accent
+    return when (accent.toArgb()) {
+        0xFF57E6C0.toInt() -> Color(0xFF07735A)
+        0xFF9E8CFF.toInt() -> Color(0xFF5B47D6)
+        0xFF6CB8FF.toInt() -> Color(0xFF1866C4)
+        0xFFFF8AA8.toInt() -> Color(0xFFB8325A)
+        0xFFFFC46B.toInt() -> Color(0xFF8E5600)
+        else -> lerp(accent, Color(0xFF101722), 0.55f)
+    }
 }
 
 private fun buildPalette(dark: Boolean, accent: Color, intensity: Float): QsPalette {
@@ -129,20 +163,22 @@ private fun buildPalette(dark: Boolean, accent: Color, intensity: Float): QsPale
             blobC = Color(0xFF9E5CFF).copy(alpha = 0.10f * i),
             text = Color(0xFFF2F6FA),
             dim = Color(0xFF8B9AB0),
-            faint = Color(0xFF5D6A7E),
+            faint = Color(0xFF748399),
             accent = accent,
             accent2 = accent2,
-            onAccent = Color(0xFF04120E),
+            accentInk = accentInkOf(accent, true),
+            onAccent = Color(0xFF06110E),
             danger = Color(0xFFFF6B7A),
             warn = Color(0xFFFFC46B),
             ok = Color(0xFF57E6C0),
-            glassTop = Color.White.copy(alpha = 0.105f * i).compositeOver(accent.copy(alpha = 0.05f * i)),
-            glassBottom = Color.White.copy(alpha = 0.04f * i).compositeOver(accent.copy(alpha = 0.028f * i)),
-            strokeTop = Color.White.copy(alpha = 0.26f * i),
-            strokeBottom = Color.White.copy(alpha = 0.04f),
-            highlight = Color.White.copy(alpha = 0.18f * i),
-            shadow = Color.Black.copy(alpha = 0.34f),
-            divider = Color.White.copy(alpha = 0.06f),
+            glassTop = Color.White.copy(alpha = 0.09f * i).compositeOver(accent.copy(alpha = 0.04f * i)),
+            glassBottom = Color.White.copy(alpha = 0.035f * i),
+            strokeTop = Color.White.copy(alpha = 0.34f * i),
+            strokeBottom = Color.White.copy(alpha = 0.12f * i),
+            highlight = Color.White.copy(alpha = 0.14f * i),
+            innerShade = Color.Black.copy(alpha = 0.18f),
+            shadow = Color.Black.copy(alpha = 0.35f),
+            divider = Color.White.copy(alpha = 0.08f),
             sheetFill = Color(0xFF0E131C).copy(alpha = 0.94f),
             scrim = Color.Black.copy(alpha = 0.52f),
             intensity = i
@@ -150,32 +186,35 @@ private fun buildPalette(dark: Boolean, accent: Color, intensity: Float): QsPale
     } else {
         QsPalette(
             dark = false,
-            bgTop = Color(0xFFF4F7FB),
-            bgBottom = Color(0xFFE9EEF5),
-            blobA = accent.copy(alpha = 0.22f * i),
-            blobB = Color(0xFF7FB4FF).copy(alpha = 0.20f * i),
-            blobC = Color(0xFFC79CFF).copy(alpha = 0.16f * i),
+            bgTop = Color(0xFFF3F6FA),
+            bgBottom = Color(0xFFE8EDF4),
+            blobA = accent.copy(alpha = 0.20f * i),
+            blobB = Color(0xFF7FB4FF).copy(alpha = 0.18f * i),
+            blobC = Color(0xFFC79CFF).copy(alpha = 0.15f * i),
             text = Color(0xFF101722),
             dim = Color(0xFF5C6B80),
-            faint = Color(0xFF8593A6),
+            faint = Color(0xFF66758A),
             accent = accent,
             accent2 = accent2,
-            onAccent = Color(0xFFFFFFFF),
-            danger = Color(0xFFD93A4E),
-            warn = Color(0xFFB7791F),
-            ok = Color(0xFF0F9D7A),
-            glassTop = Color.White.copy(alpha = 0.60f * i).compositeOver(accent.copy(alpha = 0.045f)),
-            glassBottom = Color.White.copy(alpha = 0.36f * i),
-            strokeTop = Color.White.copy(alpha = 0.92f),
-            strokeBottom = Color.White.copy(alpha = 0.30f),
+            accentInk = accentInkOf(accent, false),
+            onAccent = Color(0xFF06110E),
+            danger = Color(0xFFC42F45),
+            warn = Color(0xFF955800),
+            ok = Color(0xFF07735A),
+            glassTop = Color.White.copy(alpha = 0.72f * i).compositeOver(accent.copy(alpha = 0.03f)),
+            glassBottom = Color.White.copy(alpha = 0.52f * i),
+            strokeTop = Color.White.copy(alpha = 1f),
+            strokeBottom = Color(0xFF101722).copy(alpha = 0.10f),
             highlight = Color.White.copy(alpha = 0.75f),
-            shadow = Color(0xFF2A3A52).copy(alpha = 0.16f),
-            divider = Color(0xFF101722).copy(alpha = 0.06f),
+            innerShade = Color(0xFF101722).copy(alpha = 0.05f),
+            shadow = Color(0xFF2A3A52).copy(alpha = 0.14f),
+            divider = Color(0xFF101722).copy(alpha = 0.07f),
             sheetFill = Color(0xFFF8FAFD).copy(alpha = 0.97f),
             scrim = Color(0xFF101722).copy(alpha = 0.38f),
             intensity = i
         )
     }
+
 }
 
 /**
@@ -265,7 +304,7 @@ object QsDims {
     val cardRadius = 28.dp
     val sectionRadius = 24.dp
     val tabBarHeight = 64.dp
-    val contentBottom = 128.dp
+    val contentBottom = 148.dp
     val rowHeight = 60.dp
     val leadingIcon = 36.dp
     val buttonHeight = 52.dp

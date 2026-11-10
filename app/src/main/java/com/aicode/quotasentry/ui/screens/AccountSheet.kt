@@ -429,7 +429,7 @@ private fun OAuthPanel(
         when (mine) {
             is OAuthState.Waiting -> {
                 Row(verticalAlignment = Alignment.Top) {
-                    QsIcon(QsIcon.GLOBE, size = 15.dp, tint = p.accent)
+                    QsIcon(QsIcon.GLOBE, size = 15.dp, tint = p.accentInk)
                     Spacer(Modifier.width(8.dp))
                     MText(
                         text = mine.hint,

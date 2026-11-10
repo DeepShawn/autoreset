@@ -5,6 +5,10 @@ import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.spring
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.gestures.Orientation
+import androidx.compose.foundation.gestures.draggable
+import androidx.compose.foundation.gestures.rememberDraggableState
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
@@ -17,6 +21,7 @@ import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.statusBars
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
@@ -25,8 +30,11 @@ import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.PagerState
 import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.foundation.layout.asPaddingValues
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -36,6 +44,8 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
@@ -84,6 +94,7 @@ fun QuotaSentryRoot() {
 @Composable
 private fun RootContent() {
     val context = LocalContext.current
+    val p = QsTheme.palette
     val pager = rememberPagerState(pageCount = { 3 })
     val scope = rememberCoroutineScope()
     val now = rememberNow()
@@ -117,9 +128,8 @@ private fun RootContent() {
                         val distance = abs(
                             (pager.currentPage - page) + pager.currentPageOffsetFraction
                         ).coerceIn(0f, 1f)
-                        scaleX = 1f - 0.035f * distance
-                        scaleY = 1f - 0.035f * distance
-                        alpha = 1f - 0.22f * distance
+                        scaleX = 1f - 0.04f * distance
+                        scaleY = 1f - 0.04f * distance
                     }
             ) {
                 when (page) {
@@ -138,6 +148,19 @@ private fun RootContent() {
                 }
             }
         }
+
+        // 状态栏下面加一条渐隐遮罩，内容滚上去不会和状态栏图标糊在一起。
+        Box(
+            Modifier
+                .align(Alignment.TopCenter)
+                .fillMaxWidth()
+                .height(WindowInsets.statusBars.asPaddingValues().calculateTopPadding() + 24.dp)
+                .background(
+                    Brush.verticalGradient(
+                        listOf(p.bgTop.copy(alpha = 0.96f), p.bgTop.copy(alpha = 0f))
+                    )
+                )
+        )
 
         FloatingTabBar(
             pagerState = pager,
@@ -182,6 +205,16 @@ private fun FloatingTabBar(pagerState: PagerState, modifier: Modifier = Modifier
     val density = LocalDensity.current
     val shape = RoundedCornerShape(32.dp)
     val currentPage = pagerState.currentPage
+    val interaction = remember { MutableInteractionSource() }
+    val pressed by interaction.collectIsPressedAsState()
+    val barScale by animateFloatAsState(
+        targetValue = if (pressed) 1.03f else 1f,
+        animationSpec = spring(dampingRatio = 0.6f, stiffness = 700f),
+        label = "tabBarPress"
+    )
+    val pagerDrag = rememberDraggableState { delta ->
+        scope.launch { pagerState.dispatchRawDelta(-delta) }
+    }
 
     BoxWithConstraints(
         modifier = modifier
@@ -206,14 +239,28 @@ private fun FloatingTabBar(pagerState: PagerState, modifier: Modifier = Modifier
                     }
                     .width(tabWidth)
                     .fillMaxHeight()
+                    .graphicsLayer {
+                        val frac = (pagerState.currentPage + pagerState.currentPageOffsetFraction) % 1f
+                        val stretch = kotlin.math.sin(Math.PI * frac.toDouble()).toFloat()
+                        scaleX = 1f + 0.20f * stretch
+                        scaleY = 1f - 0.06f * stretch
+                    }
                     .clip(RoundedCornerShape(26.dp))
-                    .background(p.accent.copy(alpha = 0.14f))
+                    .background(
+                        if (p.dark) Color.White.copy(alpha = 0.12f)
+                        else Color.White.copy(alpha = 0.90f)
+                    )
+                    .border(
+                        1.dp,
+                        Brush.verticalGradient(listOf(p.strokeTop, p.strokeBottom.copy(alpha = p.strokeBottom.alpha * 0.4f))),
+                        RoundedCornerShape(26.dp)
+                    )
             )
             Row(Modifier.fillMaxSize()) {
                 tabs.forEachIndexed { index, tab ->
                     val selected = index == currentPage
                     val tint by animateColorAsState(
-                        targetValue = if (selected) p.accent else p.dim,
+                        targetValue = if (selected) p.accentInk else p.dim,
                         animationSpec = spring(dampingRatio = 0.85f, stiffness = 500f),
                         label = "tabTint"
                     )
@@ -230,14 +277,19 @@ private fun FloatingTabBar(pagerState: PagerState, modifier: Modifier = Modifier
                                 interactionSource = remember { MutableInteractionSource() },
                                 indication = null
                             ) {
-                                scope.launch { pagerState.animateScrollToPage(index) }
+                                scope.launch {
+                                    pagerState.animateScrollToPage(
+                                        index,
+                                        animationSpec = spring(dampingRatio = 0.86f, stiffness = 380f)
+                                    )
+                                }
                             },
                         horizontalAlignment = Alignment.CenterHorizontally,
                         verticalArrangement = Arrangement.Center
                     ) {
                         QsIcon(
                             icon = tab.icon,
-                            size = 21.dp,
+                            size = 24.dp,
                             tint = tint,
                             modifier = Modifier.graphicsLayer {
                                 scaleX = iconScale
@@ -248,7 +300,7 @@ private fun FloatingTabBar(pagerState: PagerState, modifier: Modifier = Modifier
                         MText(
                             text = tab.label,
                             color = tint,
-                            style = QsType.tiny,
+                            style = QsType.footnote,
                             fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
                             maxLines = 1
                         )

@@ -36,6 +36,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.draw.drawWithCache
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
@@ -173,56 +174,46 @@ fun Modifier.glassSurface(
             elevation = elevation,
             shape = shape,
             clip = false,
-            ambientColor = p.shadow.copy(alpha = p.shadow.alpha * 0.55f),
+            ambientColor = p.shadow.copy(alpha = p.shadow.alpha * 0.45f),
             spotColor = p.shadow
         )
     }
+    val rim = Brush.linearGradient(
+        0f to p.strokeTop,
+        0.45f to p.strokeTop.copy(alpha = p.strokeTop.alpha * 0.40f),
+        0.72f to p.strokeBottom.copy(alpha = p.strokeBottom.alpha * 0.45f),
+        1f to p.strokeBottom
+    )
     return m
         .clip(shape)
-        .drawBehind {
+        .drawWithCache {
             val fill = when {
                 fillTop == Color.Unspecified -> p.glassBrush()
                 fillBottom == Color.Unspecified -> Brush.verticalGradient(listOf(fillTop, fillTop))
                 else -> Brush.verticalGradient(listOf(fillTop, fillBottom))
             }
-            drawRect(fill)
-            // 顶部内侧 1dp 镜面高光
-            drawRect(
-                Brush.verticalGradient(
-                    0f to p.highlight,
-                    0.30f to p.highlight.copy(alpha = p.highlight.alpha * 0.22f),
-                    0.62f to Color.Transparent
-                )
+            // Liquid Glass：中间通透，只有顶部 20dp 高光带
+            val topBand = Brush.verticalGradient(
+                0f to p.highlight,
+                0.55f to p.highlight.copy(alpha = p.highlight.alpha * 0.28f),
+                1f to Color.Transparent,
+                startY = 0f,
+                endY = 20.dp.toPx()
             )
-            // 左上斜向反光，模拟玻璃折射
-            drawRect(
-                Brush.linearGradient(
-                    0f to p.highlight.copy(alpha = p.highlight.alpha * 0.55f),
-                    1f to Color.Transparent,
-                    start = Offset(0f, 0f),
-                    end = Offset(size.width * 1.05f, size.height * 1.25f)
-                )
+            val glowBrush = if (glow == Color.Transparent) null else Brush.radialGradient(
+                0f to glow,
+                1f to Color.Transparent,
+                center = Offset(size.width * 0.92f, size.height * 1.04f),
+                radius = size.maxDimension * 0.85f
             )
-            if (glow != Color.Transparent) {
-                drawRect(
-                    Brush.radialGradient(
-                        0f to glow,
-                        1f to Color.Transparent,
-                        center = Offset(size.width * 0.92f, size.height * 1.04f),
-                        radius = size.maxDimension * 0.85f
-                    )
-                )
+            onDrawBehind {
+                drawRect(fill)
+                drawRect(topBand)
+                glowBrush?.let { drawRect(it) }
             }
         }
-        .then(
-            if (stroke) {
-                Modifier.border(1.dp, p.strokeBrush(), shape)
-            } else {
-                Modifier
-            }
-        )
+        .then(if (stroke) Modifier.border(1.dp, rim, shape) else Modifier)
 }
-
 /** 可点击的玻璃卡片，按压时 0.985 弹簧回弹。 */
 @Composable
 fun GlassCard(
@@ -318,7 +309,7 @@ fun GlassButton(
     val shape = RoundedCornerShape(height / 2)
     val contentColor = when (style) {
         GlassButtonStyle.PRIMARY -> p.onAccent
-        GlassButtonStyle.SECONDARY -> p.accent
+        GlassButtonStyle.SECONDARY -> p.accentInk
         GlassButtonStyle.DANGER -> p.danger
     }.let { if (enabled) it else it.copy(alpha = 0.45f) }
 
@@ -445,7 +436,7 @@ fun StatusPill(
         PillTone.WARN -> p.warn
         PillTone.DANGER -> p.danger
         PillTone.NEUTRAL -> p.dim
-        PillTone.ACCENT -> p.accent
+        PillTone.ACCENT -> p.accentInk
     }
     val textColor = if (tone == PillTone.NEUTRAL) p.dim else p.text
     val interaction = remember { MutableInteractionSource() }
@@ -527,6 +518,7 @@ fun QuotaRing(
     ringSize: Dp = 82.dp,
     strokeWidth: Dp = 7.dp,
     low: Boolean = false,
+    dashed: Boolean = false,
     content: @Composable BoxScope.() -> Unit
 ) {
     val p = QsTheme.palette
@@ -557,11 +549,17 @@ fun QuotaRing(
                 style = Stroke(width = sw, cap = StrokeCap.Round)
             )
             val sweep = (animated * 360f).coerceAtLeast(2f)
-            val brush = Brush.linearGradient(
+            val brush = Brush.sweepGradient(
                 colors = listOf(p.accent, endColor),
-                start = Offset(inset, inset),
-                end = Offset(size.width - inset, size.height - inset)
+                center = Offset(size.width / 2f, size.height / 2f)
             )
+            val effect = if (dashed) {
+                androidx.compose.ui.graphics.PathEffect.dashPathEffect(
+                    floatArrayOf(2.dp.toPx(), 3.dp.toPx())
+                )
+            } else {
+                null
+            }
             drawArc(
                 brush = brush,
                 startAngle = -90f,
@@ -569,7 +567,7 @@ fun QuotaRing(
                 useCenter = false,
                 topLeft = topLeft,
                 size = arcSize,
-                style = Stroke(width = sw, cap = StrokeCap.Round)
+                style = Stroke(width = sw, cap = StrokeCap.Round, pathEffect = effect)
             )
             // 端点高光：沿弧线终点放一颗亮珠 + 外发光
             val angle = Math.toRadians((-90f + sweep).toDouble())
@@ -700,7 +698,7 @@ fun ProviderLogo(
 @Composable
 fun SourceBadge(sourceLabel: String, official: Boolean, modifier: Modifier = Modifier) {
     val p = QsTheme.palette
-    val tint = if (official) p.accent else p.dim
+    val tint = if (official) p.accentInk else p.dim
     Row(
         modifier = modifier
             .clip(RoundedCornerShape(8.dp))

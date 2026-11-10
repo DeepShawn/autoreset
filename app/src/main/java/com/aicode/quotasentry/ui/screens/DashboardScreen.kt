@@ -214,35 +214,26 @@ private fun DashboardHeader(
 ) {
     val p = QsTheme.palette
     val linked = accounts.values.count { it.linked }
-    Column {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Column(Modifier.weight(1f)) {
-                MText(text = "额度哨兵", style = QsType.hugeTitle, color = p.text, maxLines = 1)
-                Spacer(Modifier.height(4.dp))
-                MText(
-                    text = when {
-                        !running -> "后台未启动 · 点击状态胶囊开启守护"
-                        linked == 0 -> "守护中 · 还没有连接账号"
-                        else -> "已连接 $linked 家 · 状态胶囊可开启或暂停守护"
-                    },
-                    style = QsType.caption,
-                    color = p.dim,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis
-                )
-            }
-            Spacer(Modifier.width(10.dp))
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                GlassIconButton(icon = QsIcon.HISTORY, onClick = onOpenEvents, size = 42.dp)
-                GlassIconButton(icon = QsIcon.REFRESH, onClick = onRefresh, size = 42.dp)
-            }
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Column(Modifier.weight(1f)) {
+            MText(text = "额度哨兵", style = QsType.largeTitle, color = p.text, maxLines = 1)
+            Spacer(Modifier.height(2.dp))
+            MText(
+                text = when {
+                    !running -> "守护未启动"
+                    linked == 0 -> "还没有连接账号"
+                    else -> "已连接 $linked 家 · 守护中"
+                },
+                style = QsType.caption,
+                color = p.dim,
+                maxLines = 1
+            )
         }
-        Spacer(Modifier.height(12.dp))
-        StatusPill(
-            text = guardianStatusText(running, accounts, now),
-            tone = if (running) PillTone.OK else PillTone.WARN,
-            onClick = onToggleGuard
-        )
+        Spacer(Modifier.width(10.dp))
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            GlassIconButton(icon = QsIcon.HISTORY, onClick = onOpenEvents, size = 42.dp)
+            GlassIconButton(icon = QsIcon.REFRESH, onClick = onRefresh, size = 42.dp)
+        }
     }
 }
 
@@ -257,7 +248,29 @@ private fun OverviewCard(
     onStartGuard: () -> Unit
 ) {
     val p = QsTheme.palette
-    GlassCard(glow = p.accent.copy(alpha = 0.08f)) {
+    GlassCard(glow = if (running) p.accent.copy(alpha = 0.08f) else p.warn.copy(alpha = 0.10f)) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Box(
+                Modifier
+                    .size(9.dp)
+                    .background(if (running) p.ok else p.warn, CircleShape)
+            )
+            Spacer(Modifier.width(8.dp))
+            MText(
+                text = if (running) "守护中" else "守护未启动",
+                color = p.text,
+                style = QsType.bodyMedium,
+                modifier = Modifier.weight(1f)
+            )
+            if (running) {
+                MText(
+                    text = "后台常驻",
+                    color = p.dim,
+                    style = QsType.footnote
+                )
+            }
+        }
+        Spacer(Modifier.height(12.dp))
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             ProviderId.ordered.forEach { provider ->
                 val account = accounts[provider] ?: Account.empty(provider)
@@ -294,14 +307,39 @@ private fun OverviewCard(
             label = "最近一次发送",
             value = lastSend?.let { providerLabel(it.provider) + " · " + Formatters.relative(it.at, now) } ?: "还没有发送"
         )
-        Spacer(Modifier.height(7.dp))
-        RowLabel(
-            label = "下一次发送",
-            value = nextRun?.let { (provider, at) ->
-                provider.shortLabel + " · " + Formatters.clock(at) + "（" + Formatters.humanDuration(at - now) + "后）"
-            } ?: "还没有计划",
-            valueColor = if (nextRun != null) p.accent else p.dim
-        )
+        Spacer(Modifier.height(12.dp))
+        if (nextRun != null) {
+            Row(verticalAlignment = Alignment.Bottom) {
+                MText(
+                    text = Formatters.clock(nextRun.second),
+                    color = p.accentInk,
+                    style = QsType.display,
+                    maxLines = 1
+                )
+                Spacer(Modifier.width(10.dp))
+                Column(Modifier.weight(1f)) {
+                    MText(
+                        text = "下一次续命 · " + providerLabel(nextRun.first),
+                        color = p.text,
+                        style = QsType.caption,
+                        maxLines = 1
+                    )
+                    MText(
+                        text = Formatters.humanDuration(nextRun.second - now) + "后",
+                        color = p.dim,
+                        style = QsType.footnote,
+                        maxLines = 1
+                    )
+                }
+            }
+        } else {
+            MText(
+                text = "还没有计划 · 去「计划」页开一条",
+                color = p.dim,
+                style = QsType.label,
+                maxLines = 1
+            )
+        }
         if (!running) {
             Spacer(Modifier.height(12.dp))
             Row(
@@ -354,7 +392,7 @@ private fun OnboardingCard(hasRules: Boolean, onConnect: () -> Unit) {
                     .background(p.accent.copy(alpha = 0.14f), CircleShape),
                 contentAlignment = Alignment.Center
             ) {
-                QsIcon(QsIcon.SHIELD, size = 20.dp, tint = p.accent)
+                QsIcon(QsIcon.SHIELD, size = 20.dp, tint = p.accentInk)
             }
             Spacer(Modifier.width(12.dp))
             Column(Modifier.weight(1f)) {
@@ -447,10 +485,6 @@ private fun ProviderCard(
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     if (account.linked) {
                         SourceBadge(sourceLabel = view.sourceLabel, official = official)
-                        Spacer(Modifier.width(6.dp))
-                        if (!running) {
-                            GlassChip(text = if (backgroundEnabled) "服务未运行" else "后台已关闭", height = 22.dp)
-                        }
                     } else {
                         MText(text = "未连接", color = p.dim, style = QsType.caption, maxLines = 1)
                     }
@@ -461,26 +495,22 @@ private fun ProviderCard(
                 QuotaRing(
                     progress = view.remainingFraction,
                     ringSize = 78.dp,
-                    low = view.low
+                    low = view.low,
+                    dashed = !official
                 ) {
                     Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                        if (view.remainingCount != null) {
-                            MText(
-                                text = view.remainingCount.toString(),
-                                color = p.text,
-                                style = QsType.ringValue,
-                                maxLines = 1
-                            )
-                            MText(text = "条剩余", color = p.dim, style = QsType.ringUnit, maxLines = 1)
-                        } else {
-                            MText(
-                                text = Formatters.percent(view.remainingFraction),
-                                color = p.text,
-                                style = QsType.ringValue,
-                                maxLines = 1
-                            )
-                            MText(text = "剩余", color = p.dim, style = QsType.ringUnit, maxLines = 1)
-                        }
+                        MText(
+                            text = Formatters.percent(view.remainingFraction),
+                            color = p.text,
+                            style = QsType.ringValue,
+                            maxLines = 1
+                        )
+                        MText(
+                            text = if (official) "官方" else "约 ${view.remainingCount ?: "—"}/${view.totalCount ?: "—"} 条",
+                            color = p.dim,
+                            style = QsType.ringUnit,
+                            maxLines = 1
+                        )
                     }
                 }
             }
@@ -506,16 +536,32 @@ private fun ProviderCard(
         }
 
         Spacer(Modifier.height(12.dp))
-        MText(
-            text = quotaSummary(view, now),
-            color = if (view.low) p.danger else p.text,
-            style = QsType.label,
-            maxLines = 2
-        )
+        val remainingText = view.remainingCount?.let { "还剩约 $it 条" }
+            ?: ("剩余 " + Formatters.percent(view.remainingFraction))
+        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.Bottom) {
+            MText(
+                text = remainingText,
+                color = if (view.low) p.danger else p.text,
+                style = QsType.label,
+                maxLines = 1,
+                modifier = Modifier.weight(1f)
+            )
+            MText(
+                text = view.resetAt?.let { at ->
+                    if (at > now) Formatters.countdown(at - now) + "重置" else "即将重置"
+                } ?: "窗口未开始",
+                color = p.dim,
+                style = QsType.footnote,
+                maxLines = 1
+            )
+        }
         Spacer(Modifier.height(9.dp))
+        val windowElapsed = view.resetAt?.let { at ->
+            (1f - ((at - now).toFloat() / view.windowMillis).coerceIn(0f, 1f)).coerceIn(0f, 1f)
+        } ?: 0f
         ThinProgressBar(
-            progress = view.remainingFraction,
-            brush = quotaBrush(view.remainingFraction),
+            progress = windowElapsed,
+            brush = p.accentBrush(),
             height = 6.dp
         )
         Spacer(Modifier.height(8.dp))
@@ -550,20 +596,14 @@ private fun ProviderCard(
         Spacer(Modifier.height(13.dp))
         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             GlassButton(
-                text = "立即续命",
+                text = "续命",
                 icon = QsIcon.BOLT,
                 onClick = onSendNow,
                 modifier = Modifier.weight(1f),
-                height = 44.dp
+                style = if (view.low) GlassButtonStyle.PRIMARY else GlassButtonStyle.SECONDARY,
+                height = 42.dp
             )
-            GlassButton(
-                text = "刷新",
-                icon = QsIcon.REFRESH,
-                style = GlassButtonStyle.SECONDARY,
-                onClick = onRefresh,
-                height = 44.dp
-            )
-            GlassIconButton(icon = QsIcon.MORE, onClick = onMore, size = 40.dp)
+            GlassIconButton(icon = QsIcon.MORE, onClick = onMore, size = 42.dp)
         }
     }
 }
@@ -577,11 +617,11 @@ private fun quotaSummary(view: QuotaView, now: Long): String {
     val resetPart = view.resetAt?.let { at ->
         if (at > now) Formatters.countdown(at - now) + "重置" else "即将重置"
     } ?: "重置时间未知"
-    val windowPart = " · 窗口 " + Formatters.humanDuration(view.windowMillis)
-    return countPart + " · " + resetPart + windowPart
+    return countPart + " · " + resetPart
 }
 
 private fun providerLabel(provider: ProviderId): String = provider.shortLabel
+
 
 @Composable
 private fun TimelineCard(events: List<SendEvent>, now: Long, onOpenAll: () -> Unit) {
@@ -612,7 +652,7 @@ private fun TimelineCard(events: List<SendEvent>, now: Long, onOpenAll: () -> Un
 @Composable
 fun EventRow(event: SendEvent, now: Long, compact: Boolean = false) {
     val p = QsTheme.palette
-    val tint = if (event.ok) p.accent else p.danger
+    val tint = if (event.ok) p.accentInk else p.danger
     Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
         Box(
             Modifier

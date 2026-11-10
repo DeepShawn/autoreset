@@ -210,7 +210,7 @@ private fun NoPlanCard(onCreateDefaults: () -> Unit, onCreateOne: () -> Unit) {
                     .background(p.accent.copy(alpha = 0.13f), CircleShape),
                 contentAlignment = Alignment.Center
             ) {
-                QsIcon(QsIcon.CALENDAR, size = 22.dp, tint = p.accent)
+                QsIcon(QsIcon.CALENDAR, size = 22.dp, tint = p.accentInk)
             }
             Spacer(Modifier.width(12.dp))
             Column(Modifier.weight(1f)) {
@@ -526,7 +526,7 @@ private fun ScheduleEditorSheet(
             } else {
                 "等待生效"
             },
-            valueColor = p.accent
+            valueColor = p.accentInk
         )
         Spacer(Modifier.height(18.dp))
         GlassButton(

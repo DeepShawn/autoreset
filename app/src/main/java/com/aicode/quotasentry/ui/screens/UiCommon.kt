@@ -68,9 +68,10 @@ fun rememberNow(intervalMillis: Long = 30_000L): Long {
 /** 卡片 stagger 入场：fade + 上移 12dp + scale 0.98→1，全部走 spring。 */
 @Composable
 fun StaggerItem(index: Int, content: @Composable () -> Unit) {
-    var visible by remember { mutableStateOf(false) }
+    // rememberSaveable：LazyColumn 项滚出屏幕再回来不会重播入场动画。
+    var visible by androidx.compose.runtime.saveable.rememberSaveable { mutableStateOf(false) }
     LaunchedEffect(Unit) {
-        delay(30L + index * 45L)
+        delay(30L + index.coerceIn(0, 5) * 45L)
         visible = true
     }
     val t by animateFloatAsState(

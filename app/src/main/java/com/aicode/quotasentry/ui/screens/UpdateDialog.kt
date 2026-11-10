@@ -184,17 +184,9 @@ private fun DownloadingContent(info: UpdateInfo, progress: Float) {
             MText(text = "正在下载，服务端没有返回总大小…", color = p.dim, style = QsType.caption)
         }
     }
-    Spacer(Modifier.height(16.dp))
-    GlassButton(
-        text = "正在下载…",
-        loading = true,
-        enabled = false,
-        onClick = {},
-        modifier = Modifier.fillMaxWidth()
-    )
-    Spacer(Modifier.height(8.dp))
+    Spacer(Modifier.height(12.dp))
     MText(
-        text = "下载中无法取消，请稍等片刻；安装器会弹出系统安装界面。",
+        text = "下载完成后会自动打开系统安装器，请稍等片刻。",
         color = p.faint,
         style = QsType.tiny
     )

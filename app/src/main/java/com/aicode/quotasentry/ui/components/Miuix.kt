@@ -11,7 +11,10 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.Orientation
 import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.draggable
+import androidx.compose.foundation.gestures.rememberDraggableState
 import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.interaction.collectIsDraggedAsState
@@ -55,6 +58,9 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
+import androidx.compose.ui.platform.LocalView
+import androidx.compose.runtime.rememberCoroutineScope
+import kotlinx.coroutines.launch
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawBehind
@@ -178,7 +184,7 @@ fun QsTopBar(
 // Switch（照 MIUIX 视觉参数重写）
 // ────────────────────────────────────────────────────────────────────────────
 
-/** MIUIX 风格开关：49×28dp 胶囊，滑块 20dp，弹簧 0.7/987 + 按下放大 1.127。 */
+/** MIUIX 风格开关：49×28dp 胶囊轨道，滑块 20dp，可拖动，弹簧 0.7/987。 */
 @Composable
 fun MiuixSwitch(
     checked: Boolean,
@@ -190,9 +196,15 @@ fun MiuixSwitch(
     val interaction = remember { MutableInteractionSource() }
     val pressed by interaction.collectIsPressedAsState()
     val haptic = LocalHapticFeedback.current
+    val density = LocalDensity.current
+
+    val minOffset = 4.dp
+    val maxOffset = 25.dp
+    val rangePx = with(density) { (maxOffset - minOffset).toPx() }
+    var dragPx by remember { mutableFloatStateOf(0f) }
 
     val offset by animateDpAsState(
-        targetValue = if (checked) 25.dp else 4.dp,
+        targetValue = if (checked) maxOffset else minOffset,
         animationSpec = spring(dampingRatio = 0.7f, stiffness = 987f),
         label = "thumbOffset"
     )
@@ -215,21 +227,50 @@ fun MiuixSwitch(
         animationSpec = spring(dampingRatio = 0.8f, stiffness = 700f),
         label = "thumbColor"
     )
+
+    fun toggle() {
+        if (!enabled) return
+        onCheckedChange?.let {
+            haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+            it(!checked)
+        }
+    }
+
+    val dragState = rememberDraggableState { delta ->
+        dragPx = (dragPx + delta).coerceIn(-rangePx, rangePx)
+    }
     Box(
         modifier = modifier
             .size(49.dp, 28.dp)
             .clip(CircleShape)
-            .drawBehind { drawCircle(trackColor, radius = size.minDimension / 2f) }
+            .drawBehind {
+                drawRoundRect(
+                    color = trackColor,
+                    cornerRadius = androidx.compose.ui.geometry.CornerRadius(size.height / 2f)
+                )
+            }
+            .draggable(
+                state = dragState,
+                orientation = Orientation.Horizontal,
+                enabled = enabled && onCheckedChange != null,
+                onDragStopped = { velocity ->
+                    val base = with(density) { offset.toPx() }
+                    val mid = with(density) { (minOffset + maxOffset).toPx() / 2f }
+                    val targetChecked = (base + dragPx) > mid
+                    dragPx = 0f
+                    if (targetChecked != checked) {
+                        haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                        onCheckedChange?.invoke(targetChecked)
+                    }
+                }
+            )
             .then(
                 if (onCheckedChange != null) {
                     Modifier.clickable(
                         interactionSource = interaction,
                         indication = null,
                         enabled = enabled,
-                        onClick = {
-                            onCheckedChange(!checked)
-                            haptic.performHapticFeedback(HapticFeedbackType.LongPress)
-                        }
+                        onClick = { toggle() }
                     )
                 } else {
                     Modifier
@@ -237,10 +278,10 @@ fun MiuixSwitch(
             ),
         contentAlignment = Alignment.CenterStart
     ) {
+        val basePx = with(density) { offset.toPx() }
         Box(
             Modifier
-                .padding(start = 0.dp)
-                .offset(x = offset)
+                .offset { androidx.compose.ui.unit.IntOffset((basePx + dragPx).roundToInt(), 0) }
                 .size(20.dp)
                 .graphicsLayer {
                     scaleX = thumbScale
@@ -310,34 +351,46 @@ fun MiuixSlider(
                 awaitEachGesture {
                     val down = awaitFirstDown(requireUnconsumed = false)
                     val startX = down.position.x
+                    val startY = down.position.y
                     val slop = viewConfiguration.touchSlop
-                    // 按下立即跟手定位（与 iOS / MIUIX 手感一致）
-                    dragFraction = snap(startX / widthPx)
-                    dragging = true
-                    emit(dragFraction)
+                    var horizontal = false
+                    var cancelled = false
+                    var tapped = true
                     val pointer = down.id
-                    var lastX = startX
-                    var moved = false
                     while (true) {
                         val event = awaitPointerEvent()
                         val change = event.changes.firstOrNull { it.id == pointer } ?: break
-                        if (!change.pressed) {
-                            change.consume()
-                            break
-                        }
-                        val dx = change.position.x - lastX
-                        if (!moved && abs(change.position.x - startX) > slop) moved = true
-                        if (moved) {
-                            if (dx != 0f) {
-                                dragFraction = snap(dragFraction + dx / widthPx)
-                                emit(dragFraction)
+                        val dxTotal = change.position.x - startX
+                        val dyTotal = change.position.y - startY
+                        if (!horizontal && !cancelled && (
+                                abs(dxTotal) > slop || abs(dyTotal) > slop
+                            )
+                        ) {
+                            // 竖向滚动优先：把这一组手势让给父列表，不抢滑块
+                            if (abs(dyTotal) > abs(dxTotal)) {
+                                cancelled = true
+                                break
                             }
+                            horizontal = true
+                            tapped = false
+                            dragging = true
+                            dragFraction = snap(startX / widthPx)
+                            emit(dragFraction)
+                        }
+                        if (horizontal) {
+                            dragFraction = snap(change.position.x / widthPx)
+                            emit(dragFraction)
                             change.consume()
                         }
-                        lastX = change.position.x
+                        if (!change.pressed) break
+                    }
+                    if (tapped && !cancelled) {
+                        // 纯点按：定位到点击位置
+                        dragFraction = snap(startX / widthPx)
+                        emit(dragFraction)
                     }
                     dragging = false
-                    currentOnFinished?.invoke()
+                    if (!cancelled) currentOnFinished?.invoke()
                 }
             },
         contentAlignment = Alignment.CenterStart
@@ -395,7 +448,7 @@ fun <T> SegmentedControl(
     if (options.isEmpty()) return
     val p = QsTheme.palette
     val index = options.indexOf(selected).coerceAtLeast(0)
-    val shape = RoundedCornerShape(15.dp)
+    val shape = RoundedCornerShape(14.dp)
     BoxWithConstraints(
         modifier = modifier
             .fillMaxWidth()
@@ -416,15 +469,20 @@ fun <T> SegmentedControl(
                 .offset(x = indicatorX)
                 .width(itemWidth)
                 .fillMaxHeight()
-                .shadow(4.dp, RoundedCornerShape(12.dp), clip = false, ambientColor = p.shadow, spotColor = p.shadow)
-                .clip(RoundedCornerShape(12.dp))
-                .drawBehind { drawRect(p.accentBrush()) }
+                .shadow(2.dp, RoundedCornerShape(10.dp), clip = false, ambientColor = p.shadow, spotColor = p.shadow)
+                .clip(RoundedCornerShape(10.dp))
+                .background(if (p.dark) Color.White.copy(alpha = 0.14f) else Color.White)
+                .border(
+                    1.dp,
+                    Brush.verticalGradient(listOf(p.strokeTop, p.strokeBottom.copy(alpha = p.strokeBottom.alpha * 0.5f))),
+                    RoundedCornerShape(10.dp)
+                )
         )
         Row(Modifier.fillMaxSize()) {
             options.forEach { option ->
                 val isSelected = option == selected
                 val textColor by animateColorAsState(
-                    targetValue = if (isSelected) p.onAccent else p.dim,
+                    targetValue = if (isSelected) p.text else p.dim,
                     animationSpec = spring(dampingRatio = 0.9f, stiffness = 600f),
                     label = "segText"
                 )
@@ -462,6 +520,7 @@ fun ListRow(
     modifier: Modifier = Modifier,
     subtitle: String? = null,
     leadingIcon: QsIcon? = null,
+    leadingTint: androidx.compose.ui.graphics.Color? = null,
     leading: (@Composable () -> Unit)? = null,
     trailing: (@Composable () -> Unit)? = null,
     showChevron: Boolean = false,
@@ -495,7 +554,7 @@ fun ListRow(
                 .heightIn(min = QsDims.rowHeight)
                 .drawBehind {
                     if (pressAlpha > 0.001f) {
-                        drawRect(p.text.copy(alpha = 0.045f * pressAlpha))
+                        drawRect(p.text.copy(alpha = 0.08f * pressAlpha))
                     }
                 }
                 .then(clickModifier)
@@ -516,7 +575,7 @@ fun ListRow(
                     QsIcon(
                         icon = leadingIcon,
                         size = 18.dp,
-                        tint = if (danger) p.danger else p.accent
+                        tint = leadingTint ?: if (danger) p.danger else p.accentInk
                     )
                 }
                 Spacer(Modifier.width(12.dp))
@@ -525,7 +584,7 @@ fun ListRow(
                 MText(
                     text = title,
                     color = titleColor,
-                    style = QsType.bodyMedium,
+                    style = QsType.rowTitle,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis
                 )
@@ -770,6 +829,22 @@ fun GlassSheet(
     var mounted by remember { mutableStateOf(open) }
     val configuration = LocalConfiguration.current
     val maxHeight = (configuration.screenHeightDp * 0.90f).dp
+    val scope = rememberCoroutineScope()
+    var dragY by remember { mutableFloatStateOf(0f) }
+    var sheetHeightPx by remember { mutableIntStateOf(0) }
+    val dragAnim = remember { Animatable(0f) }
+    val dragState = rememberDraggableState { delta ->
+        dragY = (dragY + delta).coerceAtLeast(0f)
+    }
+    val density = LocalDensity.current
+    // Dialog 默认会再叠一层 dim 和窗口动画；关掉，只留我们自己的 scrim。
+    val dialogWindow = (LocalView.current.parent as? androidx.compose.ui.window.DialogWindowProvider)?.window
+    LaunchedEffect(Unit) {
+        runCatching {
+            dialogWindow?.setDimAmount(0f)
+            dialogWindow?.setWindowAnimations(0)
+        }
+    }
 
     LaunchedEffect(open) {
         if (open) {
@@ -791,7 +866,12 @@ fun GlassSheet(
             Box(
                 Modifier
                     .fillMaxSize()
-                    .background(p.scrim.copy(alpha = p.scrim.alpha * progress.value))
+                    .background(
+                        p.scrim.copy(
+                            alpha = p.scrim.alpha * progress.value *
+                                if (sheetHeightPx > 0) (1f - dragY / sheetHeightPx).coerceIn(0f, 1f) else 1f
+                        )
+                    )
                     .clickable(
                         interactionSource = remember { MutableInteractionSource() },
                         indication = null,
@@ -804,8 +884,10 @@ fun GlassSheet(
                     .align(Alignment.BottomCenter)
                     .wrapContentHeight()
                     .heightIn(max = maxHeight)
+                    .onSizeChanged { sheetHeightPx = it.height }
                     .graphicsLayer {
-                        translationY = (1f - progress.value) * 1200.dp.toPx()
+                        val heightPx = if (sheetHeightPx > 0) sheetHeightPx.toFloat() else 500.dp.toPx()
+                        translationY = (1f - progress.value) * heightPx + dragY
                     }
                     .clip(RoundedCornerShape(topStart = 32.dp, topEnd = 32.dp))
                     .drawBehind {
@@ -830,7 +912,33 @@ fun GlassSheet(
                     .navigationBarsPadding()
                     .imePadding()
             ) {
-                // 拖拽提示条
+                // 拖拽提示条 + 标题区：手指按住往下拖，Sheet 跟手；松手按速度决定关闭或回弹。
+                Column(
+                    Modifier
+                        .fillMaxWidth()
+                        .draggable(
+                            state = dragState,
+                            orientation = Orientation.Vertical,
+                            onDragStopped = { velocity ->
+                                val heightPx = if (sheetHeightPx > 0) sheetHeightPx.toFloat() else with(density) { 600.dp.toPx() }
+                                if (dragY > heightPx * 0.22f || velocity > 1200f) {
+                                    scope.launch {
+                                        dragY = 0f
+                                        progress.animateTo(0f, spring(dampingRatio = 1f, stiffness = 600f))
+                                        onDismiss()
+                                    }
+                                } else {
+                                    scope.launch {
+                                        dragAnim.snapTo(dragY)
+                                        dragAnim.animateTo(
+                                            0f,
+                                            spring(dampingRatio = 0.9f, stiffness = 500f)
+                                        ) { dragY = value }
+                                    }
+                                }
+                            }
+                        )
+                ) {
                 Box(
                     Modifier
                         .padding(top = 10.dp)
@@ -860,6 +968,7 @@ fun GlassSheet(
                         background = false,
                         tint = p.dim
                     )
+                }
                 }
                 Column(
                     modifier = Modifier
@@ -912,7 +1021,7 @@ fun EmptyHint(
                 .background(p.accent.copy(alpha = 0.10f)),
             contentAlignment = Alignment.Center
         ) {
-            QsIcon(icon = icon, size = 24.dp, tint = p.accent)
+            QsIcon(icon = icon, size = 24.dp, tint = p.accentInk)
         }
         Spacer(Modifier.height(12.dp))
         MText(
