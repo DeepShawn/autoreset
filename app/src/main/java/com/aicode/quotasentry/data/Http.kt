@@ -241,7 +241,7 @@ class HttpEngine(proxyConfig: ProxyConfig = ProxyConfig()) {
                         }
                         continue
                     }
-                    val text = readBounded(openStream(conn), maxBytes)
+                    val text = readBody(conn, maxBytes)
                     return HttpResult.Ok(HttpResponse(code, responseHeaders, text, conn.url.toString()))
                 } finally {
                     runCatching { conn.disconnect() }
@@ -274,7 +274,7 @@ class HttpEngine(proxyConfig: ProxyConfig = ProxyConfig()) {
         // 默认头（调用方传同名的会覆盖）
         connection.setRequestProperty("User-Agent", DEFAULT_USER_AGENT)
         connection.setRequestProperty("Accept-Language", DEFAULT_ACCEPT_LANGUAGE)
-        connection.setRequestProperty("Accept-Encoding", "gzip, deflate")
+        connection.setRequestProperty("Accept-Encoding", "identity")
         proxyAuthHeader?.let { connection.setRequestProperty("Proxy-Authorization", it) }
         headers.forEach { (name, value) ->
             if (name.isNotBlank() && value.isNotBlank()) {
@@ -292,6 +292,60 @@ class HttpEngine(proxyConfig: ProxyConfig = ProxyConfig()) {
         }
         return connection
     }
+
+    /**
+     * 读取并解压响应体：以字节魔数判断真实格式，而不是盲信 Content-Encoding。
+     * 部分代理/VPN 会「声明 gzip 但已经解压」，直接套 GZIPInputStream 会报 Not in GZIP format；
+     * 这里先读原始字节，魔数不对就按明文处理，避免这类代理环境直接失败。
+     */
+    private fun readBody(connection: java.net.HttpURLConnection, maxBytes: Int): String {
+        val raw = runCatching { readLimited(openRawStream(connection), maxBytes) }
+            .getOrElse { return "" }
+        if (raw.size >= 2 && raw[0] == 0x1f.toByte() && raw[1] == 0x8b.toByte()) {
+            return runCatching {
+                java.util.zip.GZIPInputStream(raw.inputStream()).use { input ->
+                    readLimited(input, maxBytes * 4).toString(Charsets.UTF_8)
+                }
+            }.getOrElse { String(raw, Charsets.UTF_8) }
+        }
+        val encoding = connection.contentEncoding?.lowercase().orEmpty()
+        if (encoding.contains("deflate")) {
+            return runCatching {
+                java.util.zip.InflaterInputStream(raw.inputStream()).use { input ->
+                    readLimited(input, maxBytes * 4).toString(Charsets.UTF_8)
+                }
+            }.getOrElse { String(raw, Charsets.UTF_8) }
+        }
+        return String(raw, Charsets.UTF_8)
+    }
+
+    private fun readLimited(input: InputStream, maxBytes: Int): ByteArray {
+        val buffer = ByteArrayOutputStream()
+        val chunk = ByteArray(16 * 1024)
+        var total = 0
+        try {
+            while (total < maxBytes) {
+                val read = input.read(chunk)
+                if (read < 0) break
+                val allowed = minOf(read, maxBytes - total)
+                if (allowed <= 0) break
+                buffer.write(chunk, 0, allowed)
+                total += allowed
+            }
+        } finally {
+            runCatching { input.close() }
+        }
+        return buffer.toByteArray()
+    }
+
+    private fun openRawStream(connection: java.net.HttpURLConnection): InputStream =
+        runCatching {
+            if (connection.responseCode >= 400) {
+                connection.errorStream ?: connection.inputStream
+            } else {
+                connection.inputStream
+            }
+        }.getOrElse { connection.inputStream }
 
     /** 打开响应流并按 Content-Encoding 解压；先探测 gzip 魔数，避免「头说有 gzip、实际明文」时崩掉。 */
     private fun openStream(connection: java.net.HttpURLConnection): InputStream {

@@ -56,12 +56,12 @@ object OAuthFlow {
 
     private const val CLAUDE_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
     private const val CLAUDE_SCOPES =
-        "org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers"
-    private const val CLAUDE_AUTHORIZE = "https://claude.ai/oauth/authorize"
+        "org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload"
+    private const val CLAUDE_AUTHORIZE = "https://claude.com/cai/oauth/authorize"
     private const val CLAUDE_REDIRECT = "https://platform.claude.com/oauth/code/callback"
     private val CLAUDE_TOKEN_URLS = listOf(
-        "https://console.anthropic.com/v1/oauth/token",
-        "https://platform.claude.com/v1/oauth/token"
+        "https://platform.claude.com/v1/oauth/token",
+        "https://console.anthropic.com/v1/oauth/token"
     )
 
     private const val OPENAI_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
@@ -129,7 +129,8 @@ object OAuthFlow {
             provider = provider,
             hint = when (provider) {
                 ProviderId.CLAUDE ->
-                    "已用 Chrome 打开授权页。登录完成后，复制页面显示的授权码，回到本 App 会自动读取并完成连接。"
+                    "已用 Chrome 打开授权页。登录后复制页面显示的授权码，回到本 App 会自动读取并完成连接。" +
+                        " 如果页面直接提示拒绝/无权授权，说明该账号不支持 Claude Code OAuth，请改用下方的 Cookie 或手动 OAuth 令牌。"
                 else ->
                     "已用 Chrome 打开授权页。登录并授权后会自动回到 App，无需手动复制。"
             }
@@ -352,7 +353,7 @@ object OAuthFlow {
                 "code_verifier" to pendingVerifier
             )
             if (statePart.isNotBlank()) fields["state"] = statePart
-            when (val result = engine.postForm(url, fields = fields)) {
+            when (val result = engine.postForm(url, headers = mapOf("Accept" to "application/json"), fields = fields)) {
                 is HttpResult.Ok -> {
                     val response = result.response
                     if (!response.ok) {
@@ -379,7 +380,7 @@ object OAuthFlow {
             "redirect_uri" to pendingRedirect,
             "code_verifier" to pendingVerifier
         )
-        return when (val result = engine.postForm(OPENAI_TOKEN, fields = fields)) {
+        return when (val result = engine.postForm(OPENAI_TOKEN, headers = mapOf("Accept" to "application/json"), fields = fields)) {
             is HttpResult.Ok -> {
                 val response = result.response
                 if (!response.ok) {

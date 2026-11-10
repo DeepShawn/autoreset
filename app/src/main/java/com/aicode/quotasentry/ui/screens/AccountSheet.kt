@@ -182,7 +182,7 @@ fun AccountSheet(provider: ProviderId?, onDismiss: () -> Unit) {
             )
         }
 
-        if (!account.lastError.isNullOrBlank() && !account.linked) {
+        if (!account.lastError.isNullOrBlank() && !account.linked && account.lastError != message) {
             Spacer(Modifier.height(10.dp))
             GlassCard(
                 shape = androidx.compose.foundation.shape.RoundedCornerShape(16.dp),

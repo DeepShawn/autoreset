@@ -10,7 +10,7 @@ class OAuthFlowTest {
     @Test
     fun `claude authorize url carries pkce and hosted redirect`() {
         val url = OAuthFlow.buildClaudeAuthorizeUrl("CHALLENGE", "STATE123")
-        assertTrue(url.startsWith("https://claude.ai/oauth/authorize?"))
+        assertTrue(url.startsWith("https://claude.com/cai/oauth/authorize?"))
         assertTrue(url.contains("client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e"))
         assertTrue(url.contains("redirect_uri=https%3A%2F%2Fplatform.claude.com%2Foauth%2Fcode%2Fcallback"))
         assertTrue(url.contains("code_challenge=CHALLENGE"))
