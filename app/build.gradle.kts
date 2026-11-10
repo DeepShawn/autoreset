@@ -21,8 +21,8 @@ android {
         applicationId = "com.aicode.quotasentry"
         minSdk = 26
         targetSdk = 36
-        versionCode = 11
-        versionName = "1.5.1"
+        versionCode = 12
+        versionName = "1.5.2"
 
         ndk {
             abiFilters += listOf("arm64-v8a", "armeabi-v7a")

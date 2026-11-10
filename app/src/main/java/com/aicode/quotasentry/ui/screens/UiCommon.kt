@@ -115,10 +115,13 @@ object AccountFlow {
     /** 保存 Cookie / accessToken 到指定账号（从剪贴板粘贴或手动输入后调用）。 */
     fun saveCredentials(accountId: String, cookie: String, accessToken: String) {
         Store.updateAccountById(accountId) { account ->
+            // 不要把 OAuth 流程刚写入的 accessToken 用 UI 里的旧空值覆盖掉：
+            // 授权成功后如果输入框状态没来得及同步，关闭 Sheet 的 persist 会清 token。
+            val token = accessToken.trim().ifBlank { account.credentials.accessToken }
             account.copy(
                 credentials = account.credentials.copy(
                     cookie = cookie.trim(),
-                    accessToken = accessToken.trim()
+                    accessToken = token
                 )
             )
         }

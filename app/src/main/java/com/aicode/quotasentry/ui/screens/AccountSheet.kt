@@ -123,7 +123,7 @@ fun AccountSheet(accountId: String?, onDismiss: () -> Unit) {
         when (val result = oauthState) {
             is OAuthState.Success -> {
                 val targetId = oauthAccountId
-                if (targetId != null && targetId == activeId) {
+                if (targetId != null && (activeId == null || targetId == activeId)) {
                     accessToken = Store.accountById(targetId)?.credentials?.accessToken.orEmpty()
                     messageOk = true
                     message = "已连接：" + result.label

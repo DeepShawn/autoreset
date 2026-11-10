@@ -287,8 +287,18 @@ object OAuthFlow {
         _state.value = OAuthState.Exchanging(provider)
         flowJob = scope.launch {
             val token = exchangeClaude(code)
-            if (token.ok) saveAndVerify(ProviderId.CLAUDE, token)
-            else _state.value = OAuthState.Error(ProviderId.CLAUDE, token.message)
+            if (token.ok) {
+                saveAndVerify(ProviderId.CLAUDE, token)
+            } else {
+                Store.record(
+                    provider = ProviderId.CLAUDE,
+                    ok = false,
+                    text = "Claude 授权登录失败",
+                    detail = token.message,
+                    kind = com.aicode.quotasentry.core.EventKind.ERROR
+                )
+                _state.value = OAuthState.Error(ProviderId.CLAUDE, token.message)
+            }
         }
         return true
     }
@@ -408,8 +418,18 @@ object OAuthFlow {
                                     ProviderId.CLAUDE -> exchangeClaude(code)
                                     else -> exchangeOpenAi(code, pendingVerifier, pendingRedirect)
                                 }
-                                if (token.ok) saveAndVerify(provider, token)
-                                else _state.value = OAuthState.Error(provider, token.message)
+                                if (token.ok) {
+                                    saveAndVerify(provider, token)
+                                } else {
+                                    Store.record(
+                                        provider = provider,
+                                        ok = false,
+                                        text = provider.label + " 授权登录失败",
+                                        detail = token.message,
+                                        kind = com.aicode.quotasentry.core.EventKind.ERROR
+                                    )
+                                    _state.value = OAuthState.Error(provider, token.message)
+                                }
                             }
                         }
                     }
